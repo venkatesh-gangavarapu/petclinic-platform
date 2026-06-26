@@ -37,3 +37,28 @@ output "alb_sg_id" {
   description = "ALB security group ID"
   value       = module.vpc.alb_sg_id
 }
+
+output "cluster_name" {
+  description = "EKS cluster name"
+  value       = module.eks.cluster_name
+}
+
+output "cluster_endpoint" {
+  description = "EKS API server endpoint"
+  value       = module.eks.cluster_endpoint
+}
+
+output "oidc_provider_arn" {
+  description = "EKS OIDC provider ARN for IRSA"
+  value       = module.eks.oidc_provider_arn
+}
+
+output "node_role_arn" {
+  description = "IAM role ARN for EKS worker nodes"
+  value       = module.eks.node_role_arn
+}
+
+output "kubeconfig_command" {
+  description = "Command to configure kubectl for this cluster"
+  value       = module.eks.kubeconfig_command
+}

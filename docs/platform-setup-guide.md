@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-05-20
+**Last Updated:** 2026-06-26 (E-3 EKS added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -31,11 +31,28 @@ This guide explains every infrastructure decision made in the petclinic-platform
    - [Variables and Outputs](#48-variables-and-outputs)
    - [The Bootstrap Process](#49-the-bootstrap-process)
    - [Backend Configuration](#410-backend-configuration)
-5. [The Full Setup Workflow](#5-the-full-setup-workflow)
-6. [Security Practices Explained](#6-security-practices-explained)
-7. [Cost Considerations](#7-cost-considerations)
-8. [Common Mistakes and How to Avoid Them](#8-common-mistakes-and-how-to-avoid-them)
-9. [Glossary](#9-glossary)
+5. [E-2: Networking (VPC)](#5-e-2-networking-vpc)
+   - [Why a Custom VPC?](#51-why-a-custom-vpc)
+   - [All-Public Subnet Design (ADR-0001)](#52-all-public-subnet-design-adr-0001)
+   - [What the VPC Module Creates](#53-what-the-vpc-module-creates)
+   - [Security Groups: The Real Perimeter](#54-security-groups-the-real-perimeter)
+   - [Kubernetes Tags on Subnets](#55-kubernetes-tags-on-subnets)
+   - [Dev Environment Apply: What Was Created](#56-dev-environment-apply-what-was-created)
+   - [Known Gotcha: Non-ASCII Characters in SG Descriptions](#57-known-gotcha-non-ascii-characters-in-sg-descriptions)
+6. [E-3: EKS Cluster](#6-e-3-eks-cluster)
+   - [Why EKS?](#61-why-eks)
+   - [Cluster Configuration Decisions](#62-cluster-configuration-decisions)
+   - [IAM Roles: Cluster vs Nodes](#63-iam-roles-cluster-vs-nodes)
+   - [OIDC Provider and IRSA](#64-oidc-provider-and-irsa)
+   - [Managed Node Group: ARM/Graviton](#65-managed-node-group-armgriviton)
+   - [EKS Managed Add-ons](#66-eks-managed-add-ons)
+   - [kubectl Access: How It Works](#67-kubectl-access-how-it-works)
+   - [Dev Environment Apply: What Was Created](#68-dev-environment-apply-what-was-created)
+7. [The Full Setup Workflow](#7-the-full-setup-workflow)
+8. [Security Practices Explained](#8-security-practices-explained)
+9. [Cost Considerations](#9-cost-considerations)
+10. [Common Mistakes and How to Avoid Them](#10-common-mistakes-and-how-to-avoid-them)
+11. [Glossary](#11-glossary)
 
 ---
 
@@ -1073,7 +1090,333 @@ After this, `terraform plan` and `terraform apply` can run.
 
 ---
 
-## 5. The Full Setup Workflow
+## 5. E-2: Networking (VPC)
+
+**Jira Epic:** E-2 | **Tickets:** PETPLAT-6, PETPLAT-8, PETPLAT-9 | **Blocks:** E-3 (EKS), E-5 (RDS), E-6 (Secrets)
+
+The VPC is the network foundation every other resource lives inside. No EKS cluster, RDS instance, or load balancer can be created without it. This epic provisions a reusable VPC module and wires it into the `dev` environment root module.
+
+---
+
+### 5.1 Why a Custom VPC?
+
+AWS creates a default VPC in every region and account. You could deploy directly into it, but you should not in real projects, for three reasons:
+
+1. **No isolation** — the default VPC is shared across everything you deploy in that region. A misconfigured resource could affect unrelated workloads.
+2. **No tagging control** — the default VPC has no project tags, making cost attribution impossible.
+3. **Unpredictable CIDR** — the default VPC uses `172.31.0.0/16`, which may clash with on-premise or VPN networks in real organisations.
+
+A custom VPC gives you full control over the address space, subnets, routing, and access rules from day one.
+
+---
+
+### 5.2 All-Public Subnet Design (ADR-0001)
+
+A standard production VPC uses **private subnets** for compute and **public subnets** only for load balancers, with a NAT Gateway routing outbound internet traffic from the private side. This costs ~$35–45/month per AZ.
+
+For this learning platform, all resources (EKS nodes, RDS) are placed in **public subnets**. Security groups enforce access control instead of network topology.
+
+| Approach | Monthly cost | Isolation method |
+|----------|-------------|-----------------|
+| Private subnets + NAT Gateway | ~$70/mo (2 AZs) | Network topology |
+| Public subnets + Security Groups | $0 extra | Security group rules |
+
+**What this means in practice:** EKS nodes have public IP addresses, but the security groups block all inbound traffic except what is explicitly allowed (ALB → NodePort, control plane → kubelet). RDS only accepts connections from the EKS node SG on port 3306. The effective security posture is the same; the cost difference is significant for a student environment.
+
+See `docs/adr/0001-public-subnets.md` for the full decision record.
+
+---
+
+### 5.3 What the VPC Module Creates
+
+The module lives in `terraform/modules/vpc/`. It is called from each environment root module and receives all config via input variables.
+
+```
+terraform/modules/vpc/
+├── main.tf        # All resource definitions
+├── variables.tf   # Input variables (env name, CIDR, AZ list, cluster name)
+├── outputs.tf     # vpc_id, subnet_ids, and all four SG IDs
+└── versions.tf    # Provider constraints
+```
+
+**Resources provisioned:**
+
+| Resource | Count | Name pattern |
+|----------|-------|--------------|
+| `aws_vpc` | 1 | `petclinic-{env}-vpc` |
+| `aws_internet_gateway` | 1 | `petclinic-{env}-igw` |
+| `aws_subnet` (public) | 2 | `petclinic-{env}-public-{1,2}` |
+| `aws_route_table` | 1 | `petclinic-{env}-public-rt` |
+| `aws_route_table_association` | 2 | one per subnet |
+| `aws_security_group` | 4 | `alb-sg`, `eks-cluster-sg`, `eks-node-sg`, `rds-sg` |
+| `aws_security_group_rule` | 10 | ingress/egress rules for each SG |
+
+**Total: 21 resources per environment.**
+
+The VPC CIDR for dev is `10.0.0.0/16`. Subnets are `/24` slices:
+
+| Subnet | CIDR | AZ |
+|--------|------|----|
+| `petclinic-dev-public-1` | `10.0.1.0/24` | `eu-central-1a` |
+| `petclinic-dev-public-2` | `10.0.2.0/24` | `eu-central-1b` |
+
+Two AZs are required for EKS (the control plane demands multi-AZ subnets) and for RDS subnet groups.
+
+---
+
+### 5.4 Security Groups: The Real Perimeter
+
+Four security groups are created, each scoped to a single role. Rules use **security group references** (not CIDR blocks) wherever possible, which means rules automatically track any IP change to the referenced group.
+
+#### ALB Security Group (`petclinic-{env}-alb-sg`)
+
+| Direction | Port | Source/Dest | Why |
+|-----------|------|-------------|-----|
+| Ingress | 80 | `0.0.0.0/0` | HTTP from the public internet |
+| Ingress | 443 | `0.0.0.0/0` | HTTPS from the public internet |
+| Egress | 8080 | EKS node SG | Health checks to the API Gateway pod |
+| Egress | 30000–32767 | EKS node SG | NodePort services |
+
+#### EKS Cluster Security Group (`petclinic-{env}-eks-cluster-sg`)
+
+Protects the Kubernetes API server endpoint.
+
+| Direction | Port | Source/Dest | Why |
+|-----------|------|-------------|-----|
+| Ingress | 443 | EKS node SG | Worker nodes must reach the API server |
+| Egress | all | `0.0.0.0/0` | Control plane initiates kubelet/webhook calls |
+
+#### EKS Node Security Group (`petclinic-{env}-eks-node-sg`)
+
+Applied to every EC2 worker node.
+
+| Direction | Port | Source/Dest | Why |
+|-----------|------|-------------|-----|
+| Ingress | all | self (node SG) | Pod-to-pod communication across nodes |
+| Ingress | all | EKS cluster SG | Control plane to kubelet / exec / logs |
+| Ingress | 10250 | EKS cluster SG | Kubelet API specifically |
+| Ingress | 30000–32767 | ALB SG | NodePort traffic from ALB |
+| Egress | all | `0.0.0.0/0` | ECR pulls, S3, Secrets Manager, DNS |
+
+#### RDS Security Group (`petclinic-{env}-rds-sg`)
+
+| Direction | Port | Source/Dest | Why |
+|-----------|------|-------------|-----|
+| Ingress | 3306 | EKS node SG | MySQL from application pods only |
+
+No other ingress. No egress rule needed for RDS (AWS adds a default allow-all egress on creation that is effectively unused since RDS never initiates connections).
+
+---
+
+### 5.5 Kubernetes Tags on Subnets
+
+The public subnets carry two extra tags that EKS and the AWS Load Balancer Controller require:
+
+```hcl
+"kubernetes.io/cluster/petclinic-{env}" = "shared"
+"kubernetes.io/role/elb"                = "1"
+```
+
+- **`kubernetes.io/cluster/{name}=shared`** — tells EKS which subnets it can use for managed node group placement and ENI attachment.
+- **`kubernetes.io/role/elb=1`** — tells the AWS Load Balancer Controller where to provision internet-facing ALBs. Without this tag, `kubectl apply` of an Ingress resource will fail with "no subnets found."
+
+These tags must match the EKS cluster name exactly (case-sensitive).
+
+---
+
+### 5.6 Dev Environment Apply: What Was Created
+
+The dev VPC was applied on 2026-06-26. All resources are in `eu-central-1`.
+
+| Output | Value |
+|--------|-------|
+| `vpc_id` | `vpc-0d4df9298830d864a` |
+| `subnet_ids[0]` (eu-central-1a) | `subnet-05d902f36b8ac3135` |
+| `subnet_ids[1]` (eu-central-1b) | `subnet-09c1e16d4ae229e37` |
+| `alb_sg_id` | `sg-00b5c7599d0ea1da8` |
+| `eks_cluster_sg_id` | `sg-0c3cc8f9be19ce808` |
+| `eks_node_sg_id` | `sg-0b1ba0476a516a7f3` |
+| `rds_sg_id` | `sg-0ad551c0f1e139d9a` |
+
+These IDs are stored in Terraform state (`petclinic/dev/terraform.tfstate` in S3) and will be consumed automatically by the EKS module via `terraform_remote_state` or module outputs.
+
+---
+
+### 5.7 Known Gotcha: Non-ASCII Characters in SG Descriptions
+
+**Symptom:** `terraform apply` fails with:
+
+```
+Error: creating Security Group: InvalidParameterValue: Value (...) for parameter
+GroupDescription is invalid. Character sets beyond ASCII are not supported.
+```
+
+**Cause:** AWS Security Group `description` fields only accept ASCII characters. The initial VPC module used an em dash (`—`, Unicode U+2014) in two SG descriptions, which AWS rejected.
+
+**Fix applied** in `terraform/modules/vpc/main.tf`: replaced `—` with `-` (standard hyphen) in the `alb` and `rds` security group descriptions.
+
+**Rule going forward:** Never use typographic characters (em dashes, curly quotes, ellipsis `…`) in any AWS resource name, description, or tag value. Stick to plain ASCII. This applies to all `description` fields in `aws_security_group`, `aws_iam_policy`, `aws_db_instance`, etc.
+
+---
+
+## 6. E-3: EKS Cluster
+
+**Jira Epic:** E-3 | **Tickets:** PETPLAT-12, PETPLAT-13, PETPLAT-14, PETPLAT-15, PETPLAT-16 | **Blocks:** E-8, E-9, E-10, E-11
+
+The EKS cluster is the compute platform — every application pod, every sidecar, every background job runs here. Nothing downstream (Kubernetes manifests, Helm charts, ArgoCD, CI pipeline) can be built without it.
+
+---
+
+### 6.1 Why EKS?
+
+EKS is AWS's managed Kubernetes service. You could run Kubernetes yourself on EC2, but you would be responsible for control plane availability, etcd backups, API server upgrades, and certificate rotation. EKS handles all of that and charges a flat fee ($0.10/hr per cluster) for the control plane. For a learning project the important benefit is that you get a real, production-grade Kubernetes API without managing masters.
+
+Alternatives considered:
+
+| Option | Why not used |
+|--------|-------------|
+| Self-managed K8s on EC2 | Operational burden; would dominate project time |
+| ECS (Fargate) | Not Kubernetes — different tooling, no `kubectl`, no Helm |
+| App Runner / Lambda | Not suitable for stateful microservices with service discovery |
+
+---
+
+### 6.2 Cluster Configuration Decisions
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Kubernetes version | `1.32` | Standard support as of mid-2026; spec originally said 1.29 which would incur extended support charges |
+| Authentication mode | `API_AND_CONFIG_MAP` | Supports both modern API-based access entries and legacy aws-auth ConfigMap |
+| `bootstrap_cluster_creator_admin_permissions` | `true` | Automatically grants the deploying IAM identity cluster-admin so `kubectl` works immediately after apply without any extra configuration |
+| Endpoint access | Public only | Private endpoint requires VPN or bastion; public is acceptable for a learning project with SG-enforced access |
+| Control plane logs | `api`, `audit`, `authenticator` | The three most useful for debugging auth failures and API issues. `scheduler` and `controllerManager` omitted to reduce CloudWatch cost |
+
+---
+
+### 6.3 IAM Roles: Cluster vs Nodes
+
+EKS requires two separate IAM roles. Students often confuse these.
+
+#### Cluster Role (`petclinic-dev-eks-cluster-role`)
+
+Used by the **EKS control plane** (the managed master nodes that AWS runs). It needs permission to:
+- Create ENIs for pod networking
+- Describe EC2 resources (to place nodes, manage load balancers)
+- Write to CloudWatch Logs
+
+The single managed policy `AmazonEKSClusterPolicy` covers all of this.
+
+#### Node Role (`petclinic-dev-eks-node-role`)
+
+Used by the **EC2 worker nodes** (your t4g.small instances). Each node assumes this role at boot and uses it to:
+- Register with the cluster (`AmazonEKSWorkerNodePolicy`)
+- Configure pod networking — assign/de-assign ENIs for pod IPs (`AmazonEKS_CNI_Policy`)
+- Pull images from ECR (`AmazonEC2ContainerRegistryReadOnly`)
+
+**Why two roles and not one?** Least privilege. The cluster role is assumed by AWS-managed infrastructure with a high trust boundary. The node role is assumed by EC2 instances you control. Merging them would give your EC2 instances permission to modify cluster-level AWS resources, and vice versa.
+
+---
+
+### 6.4 OIDC Provider and IRSA
+
+IRSA (IAM Roles for Service Accounts) lets individual Kubernetes pods assume specific IAM roles — without storing credentials in Secrets or granting the entire node role extra permissions.
+
+**How it works:**
+
+1. EKS exposes an OIDC issuer URL (e.g. `https://oidc.eks.eu-central-1.amazonaws.com/id/ABA87A9B...`)
+2. We register this URL as an IAM OIDC Identity Provider (`aws_iam_openid_connect_provider`)
+3. When creating an IAM role for a pod, we add a trust policy that says: "allow the OIDC provider to assume this role, but only for the service account `namespace/name`"
+4. The pod's service account token is automatically mounted and exchanged for AWS credentials via the OIDC federation
+
+**Why this matters:** The EBS CSI driver (which manages PersistentVolumes) uses IRSA. So does the AWS Load Balancer Controller (E-6), External Secrets Operator (E-7), and any custom app that needs to call AWS APIs. Every IRSA role in this project references the OIDC provider ARN created here.
+
+The `tls` provider is used to fetch the OIDC endpoint's TLS thumbprint, which IAM requires during provider registration.
+
+---
+
+### 6.5 Managed Node Group: ARM/Graviton
+
+The node group `petclinic-dev-nodes` runs on `t4g.small` instances (2 vCPU, 2 GiB RAM, ARM64 architecture).
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| AMI type | `AL2_ARM_64` | Amazon Linux 2 for ARM — required for t4g instances |
+| Capacity type | `ON_DEMAND` | Graviton free trial covers ON_DEMAND; Spot would not qualify |
+| Min/desired/max | 2 / 2 / 4 | Min 2 for HA across AZs; Karpenter (E-14) handles auto-scaling beyond desired |
+| Disk size | 20 GB | Fits within the 30 GB EBS free tier; enough for base OS + container images |
+| Architecture note | All Docker images must be built for `linux/arm64` | x86 images will fail to start on these nodes — CI uses `docker buildx` + QEMU |
+
+**Why ARM?** AWS offers a Graviton free trial for t4g instances (750 hrs/month until Dec 2026). Two t4g.small instances running 24/7 = ~1,464 hrs/month — one node is fully free, the second costs ~$11/month. For a learning project this is the lowest-cost option that still gives you a real multi-node cluster.
+
+---
+
+### 6.6 EKS Managed Add-ons
+
+EKS managed add-ons are cluster components AWS installs and manages for you. Versions are pinned by querying `aws_eks_addon_version` at plan time (most recent for the given K8s version).
+
+| Add-on | Purpose | IRSA |
+|--------|---------|------|
+| `coredns` | DNS resolution for all pods (`svc.cluster.local`) | No |
+| `kube-proxy` | `iptables`/`ipvs` rules for Service routing on each node | No |
+| `vpc-cni` | AWS VPC CNI — assigns real VPC IPs to pods (not an overlay network) | No |
+| `aws-ebs-csi-driver` | Provisions EBS volumes for PersistentVolumeClaims | Yes — `petclinic-dev-ebs-csi-driver-role` |
+
+**Why `OVERWRITE` for conflict resolution?** On a fresh cluster there are no existing add-on configurations to protect. `OVERWRITE` ensures the managed version always wins, which is the correct behaviour for initial setup. You would change this to `PRESERVE` if you customised add-on configuration in-cluster.
+
+**CoreDNS dependency:** CoreDNS pods cannot schedule until there are Ready worker nodes. The `depends_on = [aws_eks_node_group.main]` in the module ensures Terraform waits for nodes before trying to install add-ons.
+
+---
+
+### 6.7 kubectl Access: How It Works
+
+With `bootstrap_cluster_creator_admin_permissions = true`, the IAM identity that ran `terraform apply` is automatically granted `system:masters` cluster access. No extra steps needed for the deploying user.
+
+To configure `kubectl`:
+
+```bash
+aws eks update-kubeconfig --name petclinic-dev --region eu-central-1
+kubectl get nodes        # should show 2 Ready nodes
+kubectl get pods -n kube-system  # should show coredns, kube-proxy, aws-node pods
+```
+
+To grant additional IAM users/roles cluster-admin, add their ARNs to the `cluster_admin_arns` variable in `terraform/environments/dev/main.tf`:
+
+```hcl
+module "eks" {
+  ...
+  cluster_admin_arns = [
+    "arn:aws:iam::569144120198:user/another-dev",
+    "arn:aws:iam::569144120198:role/ci-role",
+  ]
+}
+```
+
+This creates `aws_eks_access_entry` + `aws_eks_access_policy_association` resources for each ARN using the `AmazonEKSClusterAdminPolicy`.
+
+---
+
+### 6.8 Dev Environment Apply: What Was Created
+
+The dev EKS cluster was applied on 2026-06-26. Total provisioning time: ~11 minutes.
+
+| Output | Value |
+|--------|-------|
+| `cluster_name` | `petclinic-dev` |
+| `cluster_endpoint` | `https://ABA87A9B2745140A4FF2F157283E5C13.gr7.eu-central-1.eks.amazonaws.com` |
+| `oidc_provider_arn` | `arn:aws:iam::569144120198:oidc-provider/oidc.eks.eu-central-1.amazonaws.com/id/ABA87A9B2745140A4FF2F157283E5C13` |
+| `node_role_arn` | `arn:aws:iam::569144120198:role/petclinic-dev-eks-node-role` |
+| `kubeconfig_command` | `aws eks update-kubeconfig --name petclinic-dev --region eu-central-1` |
+
+**Provisioning timeline:**
+- Cluster IAM roles + policy attachments: ~3s
+- EKS control plane (`petclinic-dev`): 7m4s
+- OIDC provider + EBS CSI IRSA role: ~3s
+- Node group (`petclinic-dev-nodes`): 2m41s
+- All four add-ons: ~60s
+
+---
+
+## 7. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -1106,7 +1449,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 6. Security Practices Explained
+## 8. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -1137,7 +1480,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 7. Cost Considerations
+## 9. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -1155,7 +1498,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 8. Common Mistakes and How to Avoid Them
+## 10. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -1203,7 +1546,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 9. Glossary
+## 11. Glossary
 
 | Term | Definition |
 |------|-----------|
