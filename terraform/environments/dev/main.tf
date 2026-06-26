@@ -25,3 +25,10 @@ module "eks" {
   cluster_security_group_id = module.vpc.eks_cluster_sg_id
   node_security_group_id    = module.vpc.eks_node_sg_id
 }
+
+module "ecr" {
+  source = "../../modules/ecr"
+
+  project     = var.project
+  environment = var.environment
+}

@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-26 (E-3 EKS added)
+**Last Updated:** 2026-06-26 (E-4 ECR added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -48,11 +48,20 @@ This guide explains every infrastructure decision made in the petclinic-platform
    - [EKS Managed Add-ons](#66-eks-managed-add-ons)
    - [kubectl Access: How It Works](#67-kubectl-access-how-it-works)
    - [Dev Environment Apply: What Was Created](#68-dev-environment-apply-what-was-created)
-7. [The Full Setup Workflow](#7-the-full-setup-workflow)
-8. [Security Practices Explained](#8-security-practices-explained)
-9. [Cost Considerations](#9-cost-considerations)
-10. [Common Mistakes and How to Avoid Them](#10-common-mistakes-and-how-to-avoid-them)
-11. [Glossary](#11-glossary)
+7. [E-4: Container Registry (ECR)](#7-e-4-container-registry-ecr)
+   - [Why a Private Registry?](#71-why-a-private-registry)
+   - [Repository Naming and Structure](#72-repository-naming-and-structure)
+   - [Tag Mutability: MUTABLE vs IMMUTABLE](#73-tag-mutability-mutable-vs-immutable)
+   - [Lifecycle Policies](#74-lifecycle-policies)
+   - [Building ARM64 Images with docker buildx](#75-building-arm64-images-with-docker-buildx)
+   - [The build-push.sh Script](#76-the-build-pushsh-script)
+   - [Dev Environment Apply: What Was Created](#77-dev-environment-apply-what-was-created)
+   - [Known Gotcha: tagStatus=tagged Requires a Tag Pattern](#78-known-gotcha-tagstatustagged-requires-a-tag-pattern)
+8. [The Full Setup Workflow](#8-the-full-setup-workflow)
+9. [Security Practices Explained](#9-security-practices-explained)
+10. [Cost Considerations](#10-cost-considerations)
+11. [Common Mistakes and How to Avoid Them](#11-common-mistakes-and-how-to-avoid-them)
+12. [Glossary](#12-glossary)
 
 ---
 
@@ -1416,7 +1425,190 @@ The dev EKS cluster was applied on 2026-06-26. Total provisioning time: ~11 minu
 
 ---
 
-## 7. The Full Setup Workflow
+## 7. E-4: Container Registry (ECR)
+
+**Jira Epic:** E-4 | **Tickets:** PETPLAT-18, PETPLAT-19, PETPLAT-20, PETPLAT-21, PETPLAT-85 | **Blocks:** E-10, E-17
+
+ECR (Elastic Container Registry) is the private Docker image store. Every time CI builds a new version of a service, the image is pushed here. EKS nodes pull images from here when deploying pods. Nothing in the application stack can run until images exist in ECR.
+
+---
+
+### 7.1 Why a Private Registry?
+
+You could use Docker Hub. You should not, for three reasons:
+
+1. **Pull rate limits** — Docker Hub limits anonymous pulls to 100/6h and authenticated pulls to 200/6h. With 8 services and multiple nodes pulling on every deploy, you'd hit this quickly.
+2. **Latency and cost** — Pulling from Docker Hub to an EC2 node in eu-central-1 crosses the public internet. Pulling from ECR in the same region is free and fast (same AWS backbone).
+3. **Access control** — ECR repositories are IAM-controlled. The node IAM role (`AmazonEC2ContainerRegistryReadOnly`) is the only identity that can pull. No public exposure, no credential rotation needed.
+
+---
+
+### 7.2 Repository Naming and Structure
+
+Each service gets its own ECR repository named `petclinic-{env}/{service}`. Dev and prod are fully isolated — separate repositories, separate lifecycle policies, separate image histories.
+
+| Repository | Full URI |
+|-----------|---------|
+| `petclinic-dev/config-server` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/config-server` |
+| `petclinic-dev/discovery-server` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/discovery-server` |
+| `petclinic-dev/api-gateway` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/api-gateway` |
+| `petclinic-dev/customers-service` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/customers-service` |
+| `petclinic-dev/visits-service` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/visits-service` |
+| `petclinic-dev/vets-service` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/vets-service` |
+| `petclinic-dev/genai-service` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/genai-service` |
+| `petclinic-dev/admin-server` | `569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/admin-server` |
+
+The module uses `for_each = toset(var.service_names)` to create all 8 repos from a single resource block. Adding a new service only requires appending its name to the `service_names` list.
+
+---
+
+### 7.3 Tag Mutability: MUTABLE vs IMMUTABLE
+
+Tag mutability controls whether an existing image tag can be overwritten by a new push.
+
+| Setting | Environment | Behaviour |
+|---------|-------------|-----------|
+| `MUTABLE` | dev | Pushing `:v1.0.0` again overwrites the previous image — useful for iterating during development |
+| `IMMUTABLE` | prod | Pushing to an existing tag is rejected — guarantees that what was deployed at `:abc1234` is exactly what a future deploy will pull |
+
+The module derives this automatically from `var.environment` — no extra variable to set:
+
+```hcl
+local.tag_mutability = var.environment == "prod" ? "IMMUTABLE" : "MUTABLE"
+```
+
+**Why immutability matters in prod:** A mutable tag means "the image named `:v2.1.0`" could silently change between a deploy and a rollback. Immutability makes tags permanent references — once an image is shipped, it cannot be altered.
+
+---
+
+### 7.4 Lifecycle Policies
+
+Without lifecycle policies, ECR storage grows unbounded. Each service's repository has a two-rule policy:
+
+| Priority | Rule | Effect |
+|----------|------|--------|
+| 1 | `tagStatus = untagged`, expire after 7 days | Cleans up intermediate layers and failed builds that were never tagged |
+| 2 | `tagStatus = any`, keep last 10 | Retains the 10 most recent images (tagged or not), expires anything older |
+
+**Gotcha (fixed):** ECR rejects `tagStatus = "tagged"` unless you also provide a `tagPrefixList` or `tagPatternList`. Since our tags are arbitrary SHA strings, we use `tagStatus = "any"` for the count-based rule instead — this matches the single-rule example in the technical spec and avoids the constraint entirely.
+
+**Cost impact:** At ~200 MB per service × 8 services × 10 images = ~16 GB stored = ~$1.60/month beyond the 500 MB free tier. Without lifecycle policies this would grow by ~1.6 GB per release cycle.
+
+---
+
+### 7.5 Building ARM64 Images with docker buildx
+
+The EKS nodes are `t4g.small` (ARM64/Graviton). Docker images built on a standard x86 development machine will fail to start on these nodes with `exec format error`. All images must target `linux/arm64`.
+
+**Why not use Maven's `buildDocker` profile?** The built-in Maven profile uses `docker build` (single-platform, defaults to the host architecture). On an x86 machine it produces `linux/amd64` images that cannot run on Graviton nodes.
+
+**The correct approach:**
+1. Maven builds the JAR (`./mvnw package -DskipTests`) — this is architecture-independent
+2. `docker buildx build --platform linux/arm64` builds the image using QEMU emulation on x86 hosts
+
+**How the Dockerfile works:** The app repo uses a single shared Dockerfile at `docker/Dockerfile` for all 8 services. It accepts two build args:
+
+```dockerfile
+FROM eclipse-temurin:17 AS builder
+ARG ARTIFACT_NAME          # e.g. spring-petclinic-api-gateway-4.0.1
+ARG EXPOSED_PORT           # e.g. 8081
+COPY ${ARTIFACT_NAME}.jar application.jar
+# Extracts Spring Boot layered JAR for faster subsequent builds
+RUN java -Djarmode=layertools -jar application.jar extract
+```
+
+The build context is `target/` (where the JAR lives after Maven). The `ARTIFACT_NAME` is resolved at runtime by finding the JAR in `target/` — no version number hardcoded in the script.
+
+**QEMU setup:** The script runs `docker run --rm --privileged tonistiigi/binfmt --install arm64` to register the ARM64 binary format with the kernel. This is idempotent — safe to run on ARM64 hosts and required on x86 hosts.
+
+---
+
+### 7.6 The build-push.sh Script
+
+`scripts/build-push.sh` handles the full build-and-push workflow. Key design decisions:
+
+| Decision | Rationale |
+|----------|-----------|
+| Maven builds all JARs in one pass | Faster than per-service builds; shared modules compiled once |
+| `ARTIFACT_NAME` resolved from actual JAR in `target/` | No version number hardcoded — works across project version bumps |
+| `--push` sends directly from buildx to ECR | No intermediate local load; required for cross-platform builds on x86 |
+| `--no-push` writes OCI tarballs to `/tmp/` | Smoke-test the build without touching ECR |
+| `--skip-mvn` skips Maven | Retry only the Docker steps after a partial failure |
+| `--service NAME` builds one service | Useful for targeted retries or single-service CI jobs |
+
+**Usage:**
+
+```bash
+# Full build and push (all 8 services)
+bash scripts/build-push.sh \
+  --repo-dir /path/to/spring-petclinic-microservices \
+  --env dev \
+  --tag v1.0.0
+
+# Retry a single failed service (JARs already built)
+bash scripts/build-push.sh \
+  --repo-dir /path/to/spring-petclinic-microservices \
+  --env dev \
+  --tag v1.0.0 \
+  --skip-mvn \
+  --service customers-service
+
+# Local smoke test — build but do not push
+bash scripts/build-push.sh \
+  --repo-dir /path/to/spring-petclinic-microservices \
+  --env dev \
+  --tag local \
+  --no-push
+```
+
+**Java requirement:** The script requires JDK 17 in the Bash environment. On Windows, `JAVA_HOME` is not automatically exported to Git Bash even after winget installation — prefix the command:
+
+```bash
+JAVA_HOME="C:/Program Files/Eclipse Adoptium/jdk-17.0.19.10-hotspot" bash scripts/build-push.sh ...
+```
+
+---
+
+### 7.7 Dev Environment Apply: What Was Created
+
+ECR repositories and lifecycle policies were applied on 2026-06-26. Initial images were built and pushed the same day.
+
+| Resource | Count |
+|----------|-------|
+| `aws_ecr_repository` | 8 |
+| `aws_ecr_lifecycle_policy` | 8 |
+
+Initial image push (PETPLAT-85):
+
+| Service | Tag | Platform | Status |
+|---------|-----|----------|--------|
+| config-server | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| discovery-server | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| api-gateway | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| customers-service | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| visits-service | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| vets-service | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| genai-service | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+| admin-server | `v1.0.0` | `linux/arm64` | ✓ Pushed |
+
+---
+
+### 7.8 Known Gotcha: tagStatus=tagged Requires a Tag Pattern
+
+**Symptom:** `terraform apply` fails with:
+
+```
+InvalidParameterException: Lifecycle policy validation failure:
+Must specify tagPrefixList or tagPatternList when tagStatus=TAGGED.
+```
+
+**Cause:** ECR rejects lifecycle policy rules with `tagStatus = "tagged"` unless you also specify which tag patterns to match via `tagPrefixList` (e.g. `["v"]`) or `tagPatternList` (e.g. `["*"]`).
+
+**Fix applied** in `terraform/modules/ecr/main.tf`: changed the "keep last 10" rule from `tagStatus = "tagged"` to `tagStatus = "any"`. This matches the technical spec's example and is semantically correct — we want to keep the 10 most recent images regardless of whether they are tagged.
+
+---
+
+## 8. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -1449,7 +1641,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 8. Security Practices Explained
+## 9. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -1480,7 +1672,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 9. Cost Considerations
+## 10. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -1498,7 +1690,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 10. Common Mistakes and How to Avoid Them
+## 11. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -1546,7 +1738,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 11. Glossary
+## 12. Glossary
 
 | Term | Definition |
 |------|-----------|
