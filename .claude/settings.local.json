@@ -8,7 +8,8 @@
       "Bash(git init *)",
       "Bash(git checkout *)",
       "Bash(git add *)",
-      "Bash(chmod +x \"F:/project/final-project/spring-petclinic/petclinic-platform/scripts/bootstrap-state.sh\")"
+      "Bash(chmod +x \"F:/project/final-project/spring-petclinic/petclinic-platform/scripts/bootstrap-state.sh\")",
+      "Bash(terraform validate *)"
     ]
   },
   "enabledMcpjsonServers": [
