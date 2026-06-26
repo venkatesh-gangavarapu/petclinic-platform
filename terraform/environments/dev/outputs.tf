@@ -72,3 +72,28 @@ output "ecr_registry_url" {
   description = "Base ECR registry URL for docker login"
   value       = module.ecr.registry_url
 }
+
+output "cluster_node_sg_id" {
+  description = "EKS-managed node security group ID (auto-created, attached to all managed node instances)"
+  value       = module.eks.cluster_node_security_group_id
+}
+
+output "db_endpoint" {
+  description = "RDS MySQL endpoint"
+  value       = module.rds.db_endpoint
+}
+
+output "db_port" {
+  description = "RDS MySQL port"
+  value       = module.rds.db_port
+}
+
+output "jdbc_url" {
+  description = "JDBC connection URL for Spring Boot services"
+  value       = module.rds.jdbc_url
+}
+
+output "credentials_secret_arn" {
+  description = "Secrets Manager ARN for RDS credentials (used by External Secrets Operator)"
+  value       = module.rds.credentials_secret_arn
+}

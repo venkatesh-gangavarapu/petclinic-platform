@@ -32,3 +32,31 @@ module "ecr" {
   project     = var.project
   environment = var.environment
 }
+
+# Allow the EKS-managed node SG (auto-created by EKS, distinct from our custom
+# eks-node-sg) to reach RDS on port 3306. EKS attaches this SG to all managed
+# node group instances — it is not the same as module.vpc.eks_node_sg_id.
+resource "aws_security_group_rule" "rds_ingress_eks_cluster_sg" {
+  type                     = "ingress"
+  from_port                = 3306
+  to_port                  = 3306
+  protocol                 = "tcp"
+  description              = "MySQL from EKS cluster-managed node SG"
+  security_group_id        = module.vpc.rds_sg_id
+  source_security_group_id = module.eks.cluster_node_security_group_id
+}
+
+module "rds" {
+  source = "../../modules/rds"
+
+  project     = var.project
+  environment = var.environment
+
+  subnet_ids             = module.vpc.subnet_ids
+  rds_security_group_id  = module.vpc.rds_sg_id
+
+  # dev-specific overrides
+  backup_retention_period = 7
+  skip_final_snapshot     = true
+  deletion_protection     = false
+}

@@ -48,3 +48,8 @@ output "kubeconfig_command" {
   description = "Run this command to configure kubectl for this cluster"
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${data.aws_region.current.name}"
 }
+
+output "cluster_node_security_group_id" {
+  description = "EKS-managed cluster security group automatically attached to all managed node group instances"
+  value       = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+}
