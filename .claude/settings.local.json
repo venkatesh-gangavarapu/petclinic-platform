@@ -14,7 +14,9 @@
       "Bash(terraform plan *)",
       "Bash(terraform apply *)",
       "Bash(bash -n F:/project/final-project/spring-petclinic/petclinic-platform/scripts/build-push.sh)",
-      "Bash(bash *)"
+      "Bash(bash *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl scale *)"
     ]
   },
   "enabledMcpjsonServers": [

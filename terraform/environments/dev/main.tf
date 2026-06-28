@@ -63,6 +63,29 @@ resource "aws_route53_record" "dev_app" {
   }
 }
 
+# Allow ALB to reach api-gateway pods on port 8080 (target-type=ip uses pod IPs
+# directly — traffic hits the EKS cluster SG, not the custom node SG).
+resource "aws_security_group_rule" "node_ingress_alb_8080" {
+  type                     = "ingress"
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  description              = "HTTP from ALB to api-gateway pods (target-type=ip)"
+  security_group_id        = module.eks.cluster_node_security_group_id
+  source_security_group_id = module.vpc.alb_sg_id
+}
+
+# Allow ALB egress to actual node SG on port 8080 (health checks + traffic).
+resource "aws_security_group_rule" "alb_egress_8080_cluster_sg" {
+  type                     = "egress"
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  description              = "To api-gateway pods via EKS cluster SG (target-type=ip)"
+  security_group_id        = module.vpc.alb_sg_id
+  source_security_group_id = module.eks.cluster_node_security_group_id
+}
+
 # Allow the EKS-managed node SG (auto-created by EKS, distinct from our custom
 # eks-node-sg) to reach RDS on port 3306. EKS attaches this SG to all managed
 # node group instances — it is not the same as module.vpc.eks_node_sg_id.

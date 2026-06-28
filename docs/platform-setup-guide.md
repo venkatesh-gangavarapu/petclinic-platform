@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-28 (E-7 Secrets Management added)
+**Last Updated:** 2026-06-28 (E-8 Kubernetes Base Manifests added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -84,11 +84,20 @@ This guide explains every infrastructure decision made in the petclinic-platform
     - [ExternalSecret Manifests](#106-externalsecret-manifests)
     - [Dev Environment Apply: What Was Created](#107-dev-environment-apply-what-was-created)
     - [Known Gotcha: ESO v1 Replaced v1beta1](#108-known-gotcha-eso-v1-replaced-v1beta1)
-11. [The Full Setup Workflow](#11-the-full-setup-workflow)
-12. [Security Practices Explained](#12-security-practices-explained)
-13. [Cost Considerations](#13-cost-considerations)
-14. [Common Mistakes and How to Avoid Them](#14-common-mistakes-and-how-to-avoid-them)
-15. [Glossary](#15-glossary)
+11. [E-8: Kubernetes Base Manifests](#11-e-8-kubernetes-base-manifests)
+    - [Manifest Structure per Service](#111-manifest-structure-per-service)
+    - [Startup Order and Init Containers](#112-startup-order-and-init-containers)
+    - [Health Probes](#113-health-probes)
+    - [Security Context](#114-security-context)
+    - [Spring Profiles per Service](#115-spring-profiles-per-service)
+    - [Services Running and What Was Applied](#116-services-running-and-what-was-applied)
+    - [Known Gotcha: t4g.small Memory Limits with 8 Spring Boot Services](#117-known-gotcha-t4gsmall-memory-limits-with-8-spring-boot-services)
+    - [Known Gotcha: ALB 504 — Wrong Node Security Group (Again)](#118-known-gotcha-alb-504--wrong-node-security-group-again)
+12. [The Full Setup Workflow](#12-the-full-setup-workflow)
+13. [Security Practices Explained](#13-security-practices-explained)
+14. [Cost Considerations](#14-cost-considerations)
+15. [Common Mistakes and How to Avoid Them](#15-common-mistakes-and-how-to-avoid-them)
+16. [Glossary](#16-glossary)
 
 ---
 
@@ -2342,7 +2351,229 @@ kubectl api-resources | grep external-secrets.io
 
 ---
 
-## 11. The Full Setup Workflow
+## 11. E-8: Kubernetes Base Manifests
+
+**Jira Epic:** E-8 | **Tickets:** PETPLAT-38 through PETPLAT-44 | **Blocks:** E-9, E-10, E-11
+
+Base Kubernetes manifests for all 8 microservices, defining how each service runs in the cluster: container image, environment variables, health probes, resource limits, startup dependencies, and secrets injection.
+
+---
+
+### 11.1 Manifest Structure per Service
+
+Each service has its own directory under `k8s/base/{service}/` with four files:
+
+| File | Purpose |
+|------|---------|
+| `serviceaccount.yaml` | Kubernetes ServiceAccount (annotated with IRSA role ARN where needed) |
+| `configmap.yaml` | Non-secret environment config: `CONFIG_SERVER_URL`, `SPRING_DATASOURCE_URL` |
+| `deployment.yaml` | Pod spec: image, env vars, init containers, probes, resources, security context |
+| `service.yaml` | ClusterIP Service exposing the service port within the cluster |
+
+Plus `k8s/base/namespaces.yaml` for both `petclinic-dev` and `petclinic-prod`.
+
+---
+
+### 11.2 Startup Order and Init Containers
+
+Spring Petclinic services have strict startup dependencies. Without enforcing order, services crash-loop because they can't reach Config Server or Discovery Server at startup.
+
+**Dependency chain:**
+
+```
+config-server (no deps — starts first)
+    └─→ discovery-server
+            └─→ api-gateway
+            └─→ customers-service
+            │       └─→ visits-service  (FK: visits.pet_id → pets.id)
+            └─→ vets-service
+            └─→ admin-server
+```
+
+**Enforcement mechanism:** init containers using `busybox:1.36` with `wget`:
+
+```yaml
+initContainers:
+  - name: wait-for-config-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health;
+      do echo "waiting..."; sleep 5; done']
+  - name: wait-for-discovery-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://discovery-server:8761/actuator/health;
+      do echo "waiting..."; sleep 5; done']
+```
+
+`visits-service` adds a third init container waiting for `customers-service` (port 8081), because `visits-service` runs `schema.sql` that includes `FOREIGN KEY (pet_id) REFERENCES pets(id)` — a table created by customers-service's schema init.
+
+---
+
+### 11.3 Health Probes
+
+All services follow the same probe pattern. The `startupProbe` disables readiness and liveness checks during Spring Boot initialization (which can take up to 3 minutes on constrained nodes).
+
+| Probe | Path | Period | Timeout | Failure Threshold | Max Wait |
+|-------|------|--------|---------|-------------------|---------|
+| `startupProbe` | `/actuator/health` | 10s | 5s | 30 | 5 minutes |
+| `readinessProbe` | `/actuator/health/readiness` | 10s | 5s | 3 | — |
+| `livenessProbe` | `/actuator/health/liveness` | 15s | 5s | 3 | — |
+
+`config-server` uses `/actuator/health` for all three probes (it does not expose `/readiness` or `/liveness` sub-paths).
+
+---
+
+### 11.4 Security Context
+
+All deployments run with least-privilege security context:
+
+```yaml
+# Pod level
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+# Container level
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: false  # Spring Boot needs /tmp for uploads and caching
+```
+
+`readOnlyRootFilesystem: false` is intentional — Spring Boot writes to `/tmp` for Tomcat work directories and class loading caches. Setting it to `true` would cause startup failures.
+
+Init containers (`busybox`) generate PodSecurity `warn: restricted` warnings because they lack `seccompProfile` and `capabilities.drop`. These are **warnings only** — the namespace enforces `baseline` (not `restricted`), so pods run without issue.
+
+---
+
+### 11.5 Spring Profiles per Service
+
+| Service | `SPRING_PROFILES_ACTIVE` | Why |
+|---------|--------------------------|-----|
+| config-server | `docker` | Changes Config Server URL from localhost to DNS name |
+| discovery-server | `docker` | — |
+| api-gateway | `docker` | — |
+| customers-service | `docker,mysql` | Activates MySQL datasource instead of HSQLDB |
+| visits-service | `docker,mysql` | — |
+| vets-service | `docker,mysql,production` | `production` profile required for Caffeine cache (`@Profile("production")` gate in `CacheConfig`) |
+| admin-server | `docker` | — |
+| genai-service | `docker` | Scaled to 0 — optional, needs real OpenAI key |
+
+**DB services additionally receive:**
+- `SPRING_DATASOURCE_URL` from ConfigMap (RDS JDBC URL)
+- `SPRING_DATASOURCE_USERNAME` and `SPRING_DATASOURCE_PASSWORD` from K8s Secret (`rds-credentials`, synced by ESO)
+
+**genai-service additionally receives:**
+- `OPENAI_API_KEY` from K8s Secret (`openai-api-key`, synced by ESO)
+
+---
+
+### 11.6 Services Running and What Was Applied
+
+Applied on 2026-06-28. 7 of 8 services running stably (genai-service scaled to 0 — optional).
+
+```bash
+kubectl get deployments -n petclinic-dev
+NAME                READY   UP-TO-DATE   AVAILABLE
+admin-server        1/1     1            1
+api-gateway         1/1     1            1
+config-server       1/1     1            1
+customers-service   1/1     1            1
+discovery-server    1/1     1            1
+genai-service       0/0     0            0   ← optional, scaled to 0
+vets-service        1/1     1            1
+visits-service      1/1     1            1
+```
+
+**Application accessible at:** `https://petclinic-dev.venkatesh-gangavarapu.online/index.html`
+
+All manifests applied in startup order:
+```bash
+kubectl apply -f k8s/base/namespaces.yaml
+kubectl apply -f k8s/base/config-server/
+kubectl apply -f k8s/base/discovery-server/
+kubectl apply -f k8s/base/api-gateway/
+kubectl apply -f k8s/base/customers-service/
+kubectl apply -f k8s/base/visits-service/
+kubectl apply -f k8s/base/vets-service/
+kubectl apply -f k8s/base/admin-server/
+```
+
+---
+
+### 11.7 Known Gotcha: t4g.small Memory Limits with 8 Spring Boot Services
+
+**Symptom:** Pods are evicted with `The node was low on resource: memory. Container {service} was using 348928Ki, request is 128Mi`.
+
+**Root cause:** Spring Boot with Spring Cloud (Config Client, Eureka Client, WebFlux) uses 280–350 MB actual JVM memory at runtime. The original 128Mi memory request massively understated actual usage, causing the scheduler to pack too many pods on one node. When actual usage exceeded the eviction threshold (`memory.available < 100Mi`), pods were killed.
+
+**What was tried:**
+- `256Mi` requests — nodes became `Insufficient memory` (too large to fit 8 services × 256Mi + system pods on 2 × 1408Mi nodes)
+- `RollingUpdate` strategy with 256Mi — deadlocked because peak load (old + new pod simultaneously) exceeded capacity
+- `Recreate` strategy — correct approach, kills old pod before starting new one; avoids double-pod spike
+
+**Final working configuration:**
+- Memory request: `128Mi` (helps scheduler spread pods; not a hard guarantee)
+- Memory limit: `512Mi`
+- JVM options (via `JAVA_TOOL_OPTIONS`): `-Xmx128m -XX:MaxMetaspaceSize=100m -XX:+UseContainerSupport`
+  - Hard-caps heap at 128MB + metaspace at 100MB = ~260MB max JVM footprint
+  - Prevents the JVM from growing to the container limit (512MB) which would trigger eviction
+- Deployment strategy: `Recreate` — prevents double-pod memory spike during updates
+- genai-service: scaled to 0 — it is marked optional in the spec and frees ~260MB for the other 7 services
+
+**Key lesson:** On cost-optimized nodes (t4g.small, 2GiB), Spring Boot applications require aggressive JVM tuning. In production, use `t4g.medium` or larger, or enable Karpenter (E-14) to right-size nodes dynamically.
+
+---
+
+### 11.8 Known Gotcha: ALB 504 — Wrong Node Security Group (Again)
+
+**Symptom:** `https://petclinic-dev.venkatesh-gangavarapu.online` returns `504 Gateway Timeout`. Target group shows `unhealthy: Request timed out` even though the api-gateway pod responds correctly from within the cluster.
+
+**Cause:** The same two-SG problem encountered in E-5 (RDS). The VPC module defines a custom `petclinic-dev-eks-node-sg` (`sg-0b1ba0476a516a7f3`) which is NOT attached to the managed node group instances. The ALB SG egress rules (port 8080 → custom node SG) and node SG ingress rules both referenced the wrong SG. The actual EKS cluster SG (`sg-09f6a36d59adf27a2`) had no rule allowing the ALB to reach pods on port 8080.
+
+With `alb.ingress.kubernetes.io/target-type: ip`, the ALB communicates directly with pod IPs. The pod IPs are secondary IPs on the node's ENI, which has the EKS cluster SG attached. Without an ingress rule on that SG, ALB health checks and traffic are silently dropped.
+
+**Fix applied** in `terraform/environments/dev/main.tf`:
+
+```hcl
+# ALB → pod IPs on 8080 (inbound to actual node SG)
+resource "aws_security_group_rule" "node_ingress_alb_8080" {
+  type                     = "ingress"
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  security_group_id        = module.eks.cluster_node_security_group_id
+  source_security_group_id = module.vpc.alb_sg_id
+}
+
+# ALB SG egress to actual node SG on 8080
+resource "aws_security_group_rule" "alb_egress_8080_cluster_sg" {
+  type                     = "egress"
+  from_port                = 8080
+  to_port                  = 8080
+  protocol                 = "tcp"
+  security_group_id        = module.vpc.alb_sg_id
+  source_security_group_id = module.eks.cluster_node_security_group_id
+}
+```
+
+After apply, the target group status went from `unhealthy (Request timed out)` → `healthy` within one health check cycle (~15s).
+
+**Verification:**
+```bash
+curl -sk https://petclinic-dev.venkatesh-gangavarapu.online/actuator/health
+# → {"groups":["liveness","readiness"],"status":"UP"}
+
+# Frontend accessible at:
+# https://petclinic-dev.venkatesh-gangavarapu.online/index.html
+```
+
+**Rule going forward:** Any resource that needs to receive traffic from the ALB via `target-type: ip` must have an ingress rule on `module.eks.cluster_node_security_group_id` (the EKS auto-created SG) — not `module.vpc.eks_node_sg_id` (the custom SG that is not on the nodes).
+
+---
+
+## 12. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -2375,7 +2606,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 12. Security Practices Explained
+## 13. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -2406,7 +2637,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 13. Cost Considerations
+## 14. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -2424,7 +2655,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 14. Common Mistakes and How to Avoid Them
+## 15. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -2472,7 +2703,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 15. Glossary
+## 16. Glossary
 
 | Term | Definition |
 |------|-----------|
