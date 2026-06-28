@@ -152,6 +152,63 @@ resource "aws_eks_node_group" "main" {
   ]
 }
 
+# ── ESO IRSA ─────────────────────────────────────────────────────────────────
+
+data "aws_caller_identity" "eso" {}
+
+data "aws_iam_policy_document" "eso_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.main.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${trimprefix(aws_iam_openid_connect_provider.main.url, "https://")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${trimprefix(aws_iam_openid_connect_provider.main.url, "https://")}:sub"
+      values   = ["system:serviceaccount:external-secrets:external-secrets"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "eso_secrets" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:DescribeSecret",
+    ]
+    resources = [
+      "arn:aws:secretsmanager:eu-central-1:${data.aws_caller_identity.eso.account_id}:secret:petclinic/*",
+    ]
+  }
+}
+
+resource "aws_iam_role" "eso" {
+  name               = "${local.name_prefix}-eso-role"
+  assume_role_policy = data.aws_iam_policy_document.eso_assume_role.json
+
+  tags = {
+    Name      = "${local.name_prefix}-eso-role"
+    Component = "compute"
+  }
+}
+
+resource "aws_iam_role_policy" "eso_secrets" {
+  name   = "${local.name_prefix}-eso-secrets-policy"
+  role   = aws_iam_role.eso.id
+  policy = data.aws_iam_policy_document.eso_secrets.json
+}
+
 # ── ALB Controller IRSA ───────────────────────────────────────────────────────
 
 data "aws_iam_policy_document" "lb_controller_assume_role" {

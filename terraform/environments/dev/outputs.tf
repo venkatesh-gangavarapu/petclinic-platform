@@ -83,6 +83,16 @@ output "certificate_arn" {
   value       = module.dns.certificate_arn
 }
 
+output "eso_role_arn" {
+  description = "IRSA role ARN for External Secrets Operator"
+  value       = module.eks.eso_role_arn
+}
+
+output "openai_secret_arn" {
+  description = "Secrets Manager ARN for OpenAI API key"
+  value       = module.secrets.openai_secret_arn
+}
+
 output "lb_controller_role_arn" {
   description = "IRSA role ARN for AWS Load Balancer Controller Helm install"
   value       = module.eks.lb_controller_role_arn

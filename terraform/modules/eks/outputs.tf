@@ -49,6 +49,11 @@ output "kubeconfig_command" {
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${data.aws_region.current.name}"
 }
 
+output "eso_role_arn" {
+  description = "IRSA role ARN for External Secrets Operator (annotate the external-secrets SA)"
+  value       = aws_iam_role.eso.arn
+}
+
 output "lb_controller_role_arn" {
   description = "IRSA role ARN for the AWS Load Balancer Controller (use in Helm values)"
   value       = aws_iam_role.lb_controller.arn

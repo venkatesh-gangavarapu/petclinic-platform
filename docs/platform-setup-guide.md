@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-28 (E-6 DNS & Ingress added)
+**Last Updated:** 2026-06-28 (E-7 Secrets Management added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -75,11 +75,20 @@ This guide explains every infrastructure decision made in the petclinic-platform
    - [Dev Environment Apply: What Was Created](#97-dev-environment-apply-what-was-created)
    - [Known Gotcha: Two-Step Apply for ACM Validation](#98-known-gotcha-two-step-apply-for-acm-validation)
    - [Known Gotcha: ALB Controller IAM Policy Missing DescribeListenerAttributes](#99-known-gotcha-alb-controller-iam-policy-missing-describelistenerattributes)
-10. [The Full Setup Workflow](#10-the-full-setup-workflow)
-11. [Security Practices Explained](#11-security-practices-explained)
-12. [Cost Considerations](#12-cost-considerations)
-13. [Common Mistakes and How to Avoid Them](#13-common-mistakes-and-how-to-avoid-them)
-14. [Glossary](#14-glossary)
+10. [E-7: Secrets Management](#10-e-7-secrets-management)
+    - [Why AWS Secrets Manager + External Secrets Operator?](#101-why-aws-secrets-manager--external-secrets-operator)
+    - [Secret Inventory](#102-secret-inventory)
+    - [ESO IRSA: Scoped Least-Privilege Access](#103-eso-irsa-scoped-least-privilege-access)
+    - [How ESO Works](#104-how-eso-works)
+    - [ClusterSecretStore vs SecretStore](#105-clustersecretstore-vs-secretstore)
+    - [ExternalSecret Manifests](#106-externalsecret-manifests)
+    - [Dev Environment Apply: What Was Created](#107-dev-environment-apply-what-was-created)
+    - [Known Gotcha: ESO v1 Replaced v1beta1](#108-known-gotcha-eso-v1-replaced-v1beta1)
+11. [The Full Setup Workflow](#11-the-full-setup-workflow)
+12. [Security Practices Explained](#12-security-practices-explained)
+13. [Cost Considerations](#13-cost-considerations)
+14. [Common Mistakes and How to Avoid Them](#14-common-mistakes-and-how-to-avoid-them)
+15. [Glossary](#15-glossary)
 
 ---
 
@@ -2095,7 +2104,245 @@ elasticloadbalancing:DescribeListenerAttributes
 
 ---
 
-## 10. The Full Setup Workflow
+## 10. E-7: Secrets Management
+
+**Jira Epic:** E-7 | **Tickets:** PETPLAT-33, PETPLAT-34, PETPLAT-35, PETPLAT-36, PETPLAT-37 | **Blocks:** E-8
+
+Every database-backed service needs a MySQL password. The genai-service needs an OpenAI API key. These values must reach the application pods as environment variables — without ever appearing in a Git repository, a Dockerfile, or a Kubernetes YAML file.
+
+---
+
+### 10.1 Why AWS Secrets Manager + External Secrets Operator?
+
+**AWS Secrets Manager** is the source of truth for secrets. It provides:
+- Encryption at rest (KMS `aws/secretsmanager` key)
+- Encryption in transit (HTTPS only)
+- Fine-grained IAM access control
+- Audit trail via CloudTrail
+- Auto-rotation support (not used here, but available)
+
+**External Secrets Operator (ESO)** is the bridge between Secrets Manager and Kubernetes. It runs as a controller in the cluster, watches `ExternalSecret` resources, and syncs their values from Secrets Manager into standard Kubernetes `Secret` objects.
+
+**Why not store secrets directly in K8s Secrets?** Kubernetes Secrets are base64-encoded, not encrypted — any user with namespace access can read them. More importantly, they can't be stored in Git. ESO lets the Kubernetes manifest (the `ExternalSecret` CR) live in Git safely, while the actual secret value stays in Secrets Manager.
+
+**Alternative considered:** Sealed Secrets (Bitnami). Sealed Secrets encrypts the value in Git itself. The trade-off: you can't audit access in Secrets Manager, and rotation requires a re-commit. For AWS-native infrastructure, ESO + Secrets Manager is the cleaner choice.
+
+---
+
+### 10.2 Secret Inventory
+
+| Secret Name | Type | Content | Created By |
+|------------|------|---------|-----------|
+| `petclinic/dev/rds-credentials` | JSON | `{"username":"petclinic","password":"<generated>"}` | RDS module (E-5) |
+| `petclinic/dev/openai-api-key` | Plaintext | OpenAI API key (defaults to `"demo"`) | Secrets module (E-7) |
+
+**RDS credentials** were created in E-5 by the RDS module using `random_password`. The secrets module in E-7 handles only non-RDS secrets to avoid duplication.
+
+**OpenAI API key** defaults to `"demo"` — the genai-service falls back gracefully to a demo mode when the key is not a real value. To set a real key:
+```bash
+aws secretsmanager update-secret \
+  --secret-id petclinic/dev/openai-api-key \
+  --secret-string "sk-..." \
+  --region eu-central-1
+# ESO syncs the new value within 1 hour (or immediately on next reconcile)
+```
+
+---
+
+### 10.3 ESO IRSA: Scoped Least-Privilege Access
+
+The ESO controller runs in Kubernetes but needs to call AWS Secrets Manager. IRSA (IAM Roles for Service Accounts) gives the ESO pod its own AWS identity without any static credentials.
+
+**Role:** `petclinic-dev-eso-role`
+
+**Trust policy:** Only the `external-secrets` service account in the `external-secrets` namespace can assume this role:
+```json
+"Condition": {
+  "StringEquals": {
+    "oidc.eks.eu-central-1.amazonaws.com/id/ABA87A9B...": "sts.amazonaws.com",
+    "oidc.eks.eu-central-1.amazonaws.com/id/ABA87A9B...:sub":
+      "system:serviceaccount:external-secrets:external-secrets"
+  }
+}
+```
+
+**Policy:** Least-privilege — only two actions, scoped to secrets under `petclinic/*`:
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:DescribeSecret"
+  ],
+  "Resource": "arn:aws:secretsmanager:eu-central-1:569144120198:secret:petclinic/*"
+}
+```
+
+This means ESO cannot read secrets from other projects or other environments (e.g., production secrets are inaccessible from the dev ESO role, and vice versa).
+
+---
+
+### 10.4 How ESO Works
+
+The sync flow on each reconcile cycle:
+
+```
+ExternalSecret CR (in Git)
+    │  defines: which secret, which keys, target K8s Secret name
+    ▼
+ESO controller (running in cluster)
+    │  uses IRSA token to authenticate with AWS
+    ▼
+AWS Secrets Manager
+    │  returns secret value (decrypted by KMS)
+    ▼
+ESO writes/updates K8s Secret in the namespace
+    ▼
+Pod mounts K8s Secret as env vars or volume
+```
+
+ESO re-syncs on the `refreshInterval` (1h here). If the value in Secrets Manager changes, ESO picks it up within that window and updates the K8s Secret automatically — no pod restart required unless the app reloads env vars on change.
+
+---
+
+### 10.5 ClusterSecretStore vs SecretStore
+
+| Type | Scope | Used When |
+|------|-------|-----------|
+| `SecretStore` | Single namespace | Each namespace manages its own store |
+| `ClusterSecretStore` | All namespaces | One store shared by all `ExternalSecret` CRs cluster-wide |
+
+A `ClusterSecretStore` is used here because multiple namespaces (`petclinic-dev`, eventually `petclinic-prod`) will need to pull secrets. A single store avoids duplicating the AWS provider config in every namespace.
+
+```yaml
+# k8s/base/external-secrets/cluster-secret-store.yaml
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: eu-central-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+```
+
+The `serviceAccountRef` tells ESO which service account token to project for IRSA authentication. This is the same SA that was annotated with the role ARN during Helm install.
+
+---
+
+### 10.6 ExternalSecret Manifests
+
+**RDS Credentials** (`k8s/base/external-secrets/rds-credentials.yaml`):
+
+The Secrets Manager secret is a JSON object. ESO extracts individual keys using `remoteRef.property`:
+
+```yaml
+data:
+  - secretKey: username
+    remoteRef:
+      key: petclinic/dev/rds-credentials
+      property: username   # extracts {"username": "petclinic", ...}
+  - secretKey: password
+    remoteRef:
+      key: petclinic/dev/rds-credentials
+      property: password
+```
+
+This creates a K8s Secret named `rds-credentials` with two keys: `username` and `password`. Spring Boot services reference these via `spring.datasource.username` and `spring.datasource.password` env var injections in their Deployment manifests (E-8).
+
+**OpenAI API Key** (`k8s/base/external-secrets/openai-api-key.yaml`):
+
+The Secrets Manager secret is a plaintext string. No `property` needed:
+
+```yaml
+data:
+  - secretKey: OPENAI_API_KEY
+    remoteRef:
+      key: petclinic/dev/openai-api-key
+      # no property — the entire secret value becomes OPENAI_API_KEY
+```
+
+---
+
+### 10.7 Dev Environment Apply: What Was Created
+
+Applied on 2026-06-28.
+
+**Terraform (4 resources):**
+
+| Resource | Value |
+|----------|-------|
+| `aws_iam_role.eso` | `petclinic-dev-eso-role` |
+| `aws_iam_role_policy.eso_secrets` | Inline policy — `GetSecretValue` + `DescribeSecret` on `petclinic/*` |
+| `aws_secretsmanager_secret` | `petclinic/dev/openai-api-key` |
+| `aws_secretsmanager_secret_version` | Value: `"demo"` (placeholder) |
+
+**Helm install:**
+```
+external-secrets        1/1  Running  (controller)
+external-secrets-cert-controller  1/1  Running
+external-secrets-webhook          1/1  Running
+```
+
+**Kubernetes resources applied:**
+
+| Resource | Namespace | Status |
+|----------|-----------|--------|
+| `ClusterSecretStore/aws-secrets-manager` | cluster-wide | `Valid`, `Ready=True` |
+| `ExternalSecret/rds-credentials` | `petclinic-dev` | `SecretSynced`, `Ready=True` |
+| `ExternalSecret/openai-api-key` | `petclinic-dev` | `SecretSynced`, `Ready=True` |
+
+**K8s Secrets created:**
+
+| Secret | Namespace | Keys |
+|--------|-----------|------|
+| `rds-credentials` | `petclinic-dev` | `username`, `password` |
+| `openai-api-key` | `petclinic-dev` | `OPENAI_API_KEY` |
+
+Verified:
+```bash
+kubectl get secret rds-credentials -n petclinic-dev -o jsonpath='{.data.username}' | base64 -d
+# petclinic
+kubectl get secret openai-api-key -n petclinic-dev -o jsonpath='{.data.OPENAI_API_KEY}' | base64 -d
+# demo
+```
+
+---
+
+### 10.8 Known Gotcha: ESO v1 Replaced v1beta1
+
+**Symptom:** `kubectl apply` fails with:
+```
+error: resource mapping not found for name: "aws-secrets-manager" namespace: "" from
+"cluster-secret-store.yaml": no matches for kind "ClusterSecretStore" in version
+"external-secrets.io/v1beta1"
+ensure CRDs are installed first
+```
+
+**Cause:** ESO v0.9+ promoted all resources from `v1beta1` to `v1`. The `v1beta1` API group is no longer served. Any manifest using `apiVersion: external-secrets.io/v1beta1` will be rejected even though the CRD exists.
+
+**Fix applied:** Updated all three manifests (`cluster-secret-store.yaml`, `rds-credentials.yaml`, `openai-api-key.yaml`) from `v1beta1` to `v1`.
+
+**Verify installed version:**
+```bash
+kubectl get crd clustersecretstores.external-secrets.io \
+  -o jsonpath='{.spec.versions[*].name}'
+# v1 v1beta1  ← v1beta1 may appear in the CRD but is no longer served
+kubectl api-resources | grep external-secrets.io
+# clustersecretstores  external-secrets.io/v1  ← use this
+```
+
+**Rule going forward:** Always check `kubectl api-resources | grep external-secrets` after install to confirm the served API version before writing manifests.
+
+---
+
+## 11. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -2128,7 +2375,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 11. Security Practices Explained
+## 12. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -2159,7 +2406,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 12. Cost Considerations
+## 13. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -2177,7 +2424,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 13. Common Mistakes and How to Avoid Them
+## 14. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -2225,7 +2472,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 14. Glossary
+## 15. Glossary
 
 | Term | Definition |
 |------|-----------|

@@ -34,6 +34,14 @@ module "dns" {
   domain_name = "venkatesh-gangavarapu.online"
 }
 
+module "secrets" {
+  source = "../../modules/secrets"
+
+  project     = var.project
+  environment = var.environment
+  # openai_api_key defaults to "demo" — genai-service degrades gracefully without a real key
+}
+
 module "ecr" {
   source = "../../modules/ecr"
 
