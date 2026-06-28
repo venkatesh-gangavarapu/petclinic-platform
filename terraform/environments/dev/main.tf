@@ -26,11 +26,33 @@ module "eks" {
   node_security_group_id    = module.vpc.eks_node_sg_id
 }
 
+module "dns" {
+  source = "../../modules/dns"
+
+  project     = var.project
+  environment = var.environment
+  domain_name = "venkatesh-gangavarapu.online"
+}
+
 module "ecr" {
   source = "../../modules/ecr"
 
   project     = var.project
   environment = var.environment
+}
+
+# Route 53 A record (alias) pointing dev subdomain to the ALB.
+# ALB DNS name and zone ID come from the ingress controller after kubectl apply.
+resource "aws_route53_record" "dev_app" {
+  zone_id = module.dns.zone_id
+  name    = "petclinic-dev.venkatesh-gangavarapu.online"
+  type    = "A"
+
+  alias {
+    name                   = "k8s-petclini-petclini-00eca135a7-422108278.eu-central-1.elb.amazonaws.com"
+    zone_id                = "Z215JYRZR1TBD5"
+    evaluate_target_health = true
+  }
 }
 
 # Allow the EKS-managed node SG (auto-created by EKS, distinct from our custom

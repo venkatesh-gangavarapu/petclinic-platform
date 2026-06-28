@@ -49,6 +49,11 @@ output "kubeconfig_command" {
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${data.aws_region.current.name}"
 }
 
+output "lb_controller_role_arn" {
+  description = "IRSA role ARN for the AWS Load Balancer Controller (use in Helm values)"
+  value       = aws_iam_role.lb_controller.arn
+}
+
 output "cluster_node_security_group_id" {
   description = "EKS-managed cluster security group automatically attached to all managed node group instances"
   value       = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id

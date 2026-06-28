@@ -152,6 +152,58 @@ resource "aws_eks_node_group" "main" {
   ]
 }
 
+# ── ALB Controller IRSA ───────────────────────────────────────────────────────
+
+data "aws_iam_policy_document" "lb_controller_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.main.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${trimprefix(aws_iam_openid_connect_provider.main.url, "https://")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${trimprefix(aws_iam_openid_connect_provider.main.url, "https://")}:sub"
+      values   = ["system:serviceaccount:kube-system:aws-load-balancer-controller"]
+    }
+  }
+}
+
+resource "aws_iam_role" "lb_controller" {
+  name               = "${local.name_prefix}-lb-controller-role"
+  assume_role_policy = data.aws_iam_policy_document.lb_controller_assume_role.json
+
+  tags = {
+    Name      = "${local.name_prefix}-lb-controller-role"
+    Component = "compute"
+  }
+}
+
+resource "aws_iam_policy" "lb_controller" {
+  name        = "${local.name_prefix}-lb-controller-policy"
+  description = "IAM policy for AWS Load Balancer Controller"
+  policy      = file("${path.module}/lb-controller-iam-policy.json")
+
+  tags = {
+    Name      = "${local.name_prefix}-lb-controller-policy"
+    Component = "compute"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "lb_controller" {
+  role       = aws_iam_role.lb_controller.name
+  policy_arn = aws_iam_policy.lb_controller.arn
+}
+
 # ── Additional Cluster Admins ─────────────────────────────────────────────────
 
 resource "aws_eks_access_entry" "admin" {

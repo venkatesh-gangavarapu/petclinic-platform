@@ -73,6 +73,26 @@ output "ecr_registry_url" {
   value       = module.ecr.registry_url
 }
 
+output "zone_name_servers" {
+  description = "Route 53 nameservers - set these in Namecheap to delegate DNS"
+  value       = module.dns.zone_name_servers
+}
+
+output "certificate_arn" {
+  description = "ACM wildcard certificate ARN for *.venkatesh-gangavarapu.online"
+  value       = module.dns.certificate_arn
+}
+
+output "lb_controller_role_arn" {
+  description = "IRSA role ARN for AWS Load Balancer Controller Helm install"
+  value       = module.eks.lb_controller_role_arn
+}
+
+output "app_url" {
+  description = "Dev application URL (once DNS and Ingress are configured)"
+  value       = "https://petclinic-dev.venkatesh-gangavarapu.online"
+}
+
 output "cluster_node_sg_id" {
   description = "EKS-managed node security group ID (auto-created, attached to all managed node instances)"
   value       = module.eks.cluster_node_security_group_id

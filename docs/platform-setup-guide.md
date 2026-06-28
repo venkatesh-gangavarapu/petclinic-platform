@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-26 (E-4 ECR added)
+**Last Updated:** 2026-06-28 (E-6 DNS & Ingress added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -57,11 +57,29 @@ This guide explains every infrastructure decision made in the petclinic-platform
    - [The build-push.sh Script](#76-the-build-pushsh-script)
    - [Dev Environment Apply: What Was Created](#77-dev-environment-apply-what-was-created)
    - [Known Gotcha: tagStatus=tagged Requires a Tag Pattern](#78-known-gotcha-tagstatustagged-requires-a-tag-pattern)
-8. [The Full Setup Workflow](#8-the-full-setup-workflow)
-9. [Security Practices Explained](#9-security-practices-explained)
-10. [Cost Considerations](#10-cost-considerations)
-11. [Common Mistakes and How to Avoid Them](#11-common-mistakes-and-how-to-avoid-them)
-12. [Glossary](#12-glossary)
+8. [E-5: Database (RDS MySQL)](#8-e-5-database-rds-mysql)
+   - [Why a Single Shared Database?](#81-why-a-single-shared-database)
+   - [Instance Configuration Decisions](#82-instance-configuration-decisions)
+   - [Credentials: random_password + Secrets Manager](#83-credentials-random_password--secrets-manager)
+   - [Parameter Group: utf8mb4](#84-parameter-group-utf8mb4)
+   - [Database Schema and Initialization Order](#85-database-schema-and-initialization-order)
+   - [Dev Environment Apply: What Was Created](#86-dev-environment-apply-what-was-created)
+   - [Known Gotcha: EKS Cluster SG vs Custom Node SG](#87-known-gotcha-eks-cluster-sg-vs-custom-node-sg)
+9. [E-6: DNS & Ingress](#9-e-6-dns--ingress)
+   - [Architecture Overview](#91-architecture-overview)
+   - [Route 53 Hosted Zone](#92-route-53-hosted-zone)
+   - [ACM Wildcard Certificate](#93-acm-wildcard-certificate)
+   - [Namecheap to Route 53 Delegation](#94-namecheap-to-route-53-delegation)
+   - [AWS Load Balancer Controller and IRSA](#95-aws-load-balancer-controller-and-irsa)
+   - [Ingress Manifest](#96-ingress-manifest)
+   - [Dev Environment Apply: What Was Created](#97-dev-environment-apply-what-was-created)
+   - [Known Gotcha: Two-Step Apply for ACM Validation](#98-known-gotcha-two-step-apply-for-acm-validation)
+   - [Known Gotcha: ALB Controller IAM Policy Missing DescribeListenerAttributes](#99-known-gotcha-alb-controller-iam-policy-missing-describelistenerattributes)
+10. [The Full Setup Workflow](#10-the-full-setup-workflow)
+11. [Security Practices Explained](#11-security-practices-explained)
+12. [Cost Considerations](#12-cost-considerations)
+13. [Common Mistakes and How to Avoid Them](#13-common-mistakes-and-how-to-avoid-them)
+14. [Glossary](#14-glossary)
 
 ---
 
@@ -1608,7 +1626,476 @@ Must specify tagPrefixList or tagPatternList when tagStatus=TAGGED.
 
 ---
 
-## 8. The Full Setup Workflow
+## 8. E-5: Database (RDS MySQL)
+
+**Jira Epic:** E-5 | **Tickets:** PETPLAT-22, PETPLAT-23, PETPLAT-24, PETPLAT-25, PETPLAT-26 | **Blocks:** E-7, E-8
+
+Three of the eight microservices (customers, visits, vets) are backed by MySQL. All three share a single RDS instance and a single `petclinic` database — this is by design in the original Spring Petclinic application, which has cross-service foreign keys that make separate databases impractical.
+
+---
+
+### 8.1 Why a Single Shared Database?
+
+A microservices purist would give each service its own database. The Spring Petclinic application cannot be split that way without schema changes, because `visits.pet_id` is a FK to `pets.id` which lives in the customers-service schema. Querying visits requires joins across what would be two separate databases.
+
+For this learning project, one shared RDS instance is the correct choice:
+
+| Approach | Cost | Complexity | Correct for this app |
+|----------|------|------------|----------------------|
+| Shared `petclinic` DB on one RDS | ~$0 (free tier) | Low | Yes |
+| One RDS per service (3 total) | ~$0 × 3 (all free tier) | Medium | No — FK constraints span services |
+| Separate schemas on one RDS | ~$0 | Medium | Possible but unnecessary |
+
+In production with a different application, separate databases per service would be the right call.
+
+---
+
+### 8.2 Instance Configuration Decisions
+
+| Parameter | Value | Why |
+|-----------|-------|-----|
+| Engine | MySQL 8.0 | LTS release; all three services' `schema.sql` scripts target MySQL syntax |
+| Instance class | `db.t4g.micro` | ARM64/Graviton — RDS free tier eligible (750 hrs/month for 12 months) |
+| Storage | 20 GB gp2 | Free tier ceiling; autoscaling disabled (`max_allocated_storage = 20`) to prevent surprise charges |
+| `storage_encrypted` | `true` | Default AWS KMS key — no extra cost, required by security rules |
+| `publicly_accessible` | `false` | RDS placed in public subnets (all-public design) but no public IP assigned — SG is the perimeter |
+| `multi_az` | `false` | Adds ~$0/hr standby instance — not needed for a learning project; teach the trade-off |
+| `backup_retention_period` | 7 days | Allows point-in-time recovery up to 1 week back |
+| `skip_final_snapshot` | `true` (dev) | Allows `terraform destroy` without blocking on a snapshot |
+| `deletion_protection` | `false` | Safety hook in `.claude/settings.json` blocks `terraform destroy` anyway |
+| `apply_immediately` | `true` | Changes take effect immediately rather than waiting for next maintenance window |
+
+**Why `publicly_accessible = false` matters even in public subnets:** The RDS instance will not receive a public IP address. The only way to reach it is through a resource in the same VPC with the correct security group. An attacker with a port scanner cannot reach port 3306 from the internet.
+
+---
+
+### 8.3 Credentials: random_password + Secrets Manager
+
+The master password is generated by Terraform's `random_password` resource and immediately stored in AWS Secrets Manager. It is never written to a file, a variable, or any human-readable output.
+
+```hcl
+resource "random_password" "db_master" {
+  length           = 16
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"  # excludes @, /, ", ' which break JDBC URLs
+}
+```
+
+The `override_special` parameter excludes characters that would require URL-encoding or shell escaping in a JDBC connection string. A password like `pass@word/1` would break `jdbc:mysql://host:3306/db?user=u&password=pass@word/1`.
+
+The secret is stored as a JSON object under the name `petclinic/{env}/rds-credentials`:
+
+```json
+{
+  "username": "petclinic",
+  "password": "<generated 16-char value>"
+}
+```
+
+This JSON format matches what the External Secrets Operator (E-7) expects when syncing to a Kubernetes Secret. The `credentials_secret_arn` output is what the ESO ClusterSecretStore references.
+
+**Terraform state:** The password value is marked `sensitive = true` by the `random_password` provider. It appears as `(sensitive value)` in plan output and is encrypted in the S3 state file (at rest via bucket SSE and in transit via TLS). It is never shown in `terraform output` unless explicitly requested with `-json`.
+
+---
+
+### 8.4 Parameter Group: utf8mb4
+
+MySQL's default character set (`latin1`) cannot store emoji, CJK characters, or other Unicode outside the Basic Multilingual Plane. `utf8mb4` is the correct full Unicode encoding for modern applications.
+
+The parameter group `petclinic-dev-mysql8` sets:
+
+| Parameter | Value |
+|-----------|-------|
+| `character_set_server` | `utf8mb4` |
+| `collation_server` | `utf8mb4_unicode_ci` |
+
+`utf8mb4_unicode_ci` is case-insensitive and accent-insensitive — correct for most application data. If you needed case-sensitive comparisons (e.g., passwords stored in MySQL), you would use `utf8mb4_bin`.
+
+---
+
+### 8.5 Database Schema and Initialization Order
+
+All three services share one database: `petclinic`. Each service's `schema.sql` begins with:
+
+```sql
+CREATE DATABASE IF NOT EXISTS petclinic;
+USE petclinic;
+```
+
+**Tables (7 total):**
+
+| Service | Tables | Cross-service FK |
+|---------|--------|-----------------|
+| customers-service | `types`, `owners`, `pets` | None |
+| vets-service | `vets`, `specialties`, `vet_specialties` | None |
+| visits-service | `visits` | `pet_id` → `pets(id)` in customers schema |
+
+**Critical init order:** `visits.pet_id` is a FK to `pets.id`. The `pets` table is created by customers-service. If visits-service starts and tries to run its `schema.sql` before customers-service has run, the FK constraint will fail.
+
+**Strategy:** Spring Boot auto-initializes schemas at startup when the `mysql` profile is active (`spring.sql.init.mode=always`). Enforce order by deploying customers-service first — its pod must reach `Running` state before visits-service is deployed. In Kubernetes this is achieved with init containers or by sequencing ArgoCD Application syncs.
+
+**Connection string format:**
+
+```
+jdbc:mysql://petclinic-dev-mysql.cfmmsg4kemne.eu-central-1.rds.amazonaws.com:3306/petclinic
+```
+
+This JDBC URL goes into the Kubernetes ConfigMap for each database-backed service (customers, visits, vets). The username and password come from the Kubernetes Secret created by the External Secrets Operator (E-7).
+
+---
+
+### 8.6 Dev Environment Apply: What Was Created
+
+RDS was applied on 2026-06-26. Total provisioning time: ~9 minutes.
+
+| Resource | Value |
+|----------|-------|
+| `aws_db_instance` | `petclinic-dev-mysql` |
+| `db_endpoint` | `petclinic-dev-mysql.cfmmsg4kemne.eu-central-1.rds.amazonaws.com` |
+| `db_port` | `3306` |
+| `jdbc_url` | `jdbc:mysql://petclinic-dev-mysql.cfmmsg4kemne.eu-central-1.rds.amazonaws.com:3306/petclinic` |
+| `credentials_secret_arn` | `arn:aws:secretsmanager:eu-central-1:569144120198:secret:petclinic/dev/rds-credentials-E4eRMj` |
+| `aws_db_parameter_group` | `petclinic-dev-mysql8` (mysql8.0 family, utf8mb4) |
+| `aws_db_subnet_group` | `petclinic-dev-db-subnet-group` (both AZs) |
+| `aws_secretsmanager_secret` | `petclinic/dev/rds-credentials` |
+
+**Connectivity verified** from an EKS pod (PETPLAT-26):
+
+```sql
+mysql> SHOW DATABASES;
++--------------------+
+| Database           |
++--------------------+
+| information_schema |
+| mysql              |
+| performance_schema |
+| petclinic          |  ← confirmed created
+| sys                |
++--------------------+
+
+mysql> SELECT VERSION();
++-----------+
+| VERSION() |
++-----------+
+| 8.0.45    |
++-----------+
+```
+
+---
+
+### 8.7 Known Gotcha: EKS Cluster SG vs Custom Node SG
+
+**Symptom:** MySQL debug pod gets `ERROR 2003 (HY000): Can't connect to MySQL server on '...':3306 (110)` — connection timeout, not refused.
+
+**Cause:** EKS automatically creates its own security group (`sg-09f6a36d59adf27a2`) and attaches it to all managed node group instances. This is the `cluster_security_group_id` field on the EKS cluster resource. It is **different** from the custom `petclinic-dev-eks-node-sg` (`sg-0b1ba0476a516a7f3`) defined in the VPC module. Our initial RDS ingress rule referenced the custom SG, which was never actually on the nodes.
+
+**Fix applied:**
+
+1. Added `cluster_node_security_group_id` output to `terraform/modules/eks/outputs.tf`:
+   ```hcl
+   output "cluster_node_security_group_id" {
+     value = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+   }
+   ```
+
+2. Added a targeted SG rule at the environment level in `terraform/environments/dev/main.tf`:
+   ```hcl
+   resource "aws_security_group_rule" "rds_ingress_eks_cluster_sg" {
+     type                     = "ingress"
+     from_port                = 3306
+     to_port                  = 3306
+     protocol                 = "tcp"
+     security_group_id        = module.vpc.rds_sg_id
+     source_security_group_id = module.eks.cluster_node_security_group_id
+   }
+   ```
+
+**Rule going forward:** When referencing EKS node security groups in other resources (RDS, ElastiCache, etc.), always use `aws_eks_cluster.main.vpc_config[0].cluster_security_group_id` — not a custom SG defined outside the cluster. The EKS-managed SG is the one that actually controls node-level traffic for managed node groups.
+
+---
+
+## 9. E-6: DNS & Ingress
+
+**Jira Epic:** E-6 | **Tickets:** PETPLAT-28, PETPLAT-29, PETPLAT-30, PETPLAT-31, PETPLAT-32 | **Blocks:** E-8 (ingress manifests)
+
+This epic makes the application reachable from the public internet via HTTPS at `petclinic-dev.venkatesh-gangavarapu.online`. It has three independent pieces: DNS (Route 53 + ACM), the ALB controller (Helm), and the Ingress resource (K8s manifest).
+
+---
+
+### 9.1 Architecture Overview
+
+```
+User browser
+    │ HTTPS  petclinic-dev.venkatesh-gangavarapu.online
+    ▼
+Route 53 A record (alias)
+    │
+    ▼
+Application Load Balancer  (created by ALB controller from the Ingress resource)
+    │  TLS terminated here (ACM cert)
+    │  HTTP 80 → redirect 443
+    ▼
+api-gateway pod :8080  (Spring Cloud Gateway + AngularJS frontend)
+    │
+    ├──→ customers-service :8081
+    ├──→ visits-service    :8082
+    ├──→ vets-service      :8083
+    └──→ genai-service     :8084
+```
+
+The ALB only routes to one backend — the API Gateway. All service-to-service routing is handled by Spring Cloud Gateway using Eureka service discovery. The ALB is not aware of the other services.
+
+---
+
+### 9.2 Route 53 Hosted Zone
+
+A Route 53 public hosted zone for `venkatesh-gangavarapu.online` is the DNS authority for the domain. Once created, it provides four nameserver (NS) records that must be configured in the domain registrar (Namecheap in this case) to delegate DNS authority to AWS.
+
+```
+ns-1233.awsdns-26.org
+ns-1573.awsdns-04.co.uk
+ns-17.awsdns-02.com
+ns-878.awsdns-45.net
+```
+
+**Zone ID:** `Z05630701AKIZST1G5L17`
+
+**Cost:** $0.50/month per hosted zone — the only fixed DNS cost.
+
+---
+
+### 9.3 ACM Wildcard Certificate
+
+A wildcard certificate `*.venkatesh-gangavarapu.online` covers all subdomains with a single cert. A Subject Alternative Name (SAN) on the apex domain (`venkatesh-gangavarapu.online`) is included for direct root access.
+
+```hcl
+resource "aws_acm_certificate" "main" {
+  domain_name               = "*.venkatesh-gangavarapu.online"
+  subject_alternative_names = ["venkatesh-gangavarapu.online"]
+  validation_method         = "DNS"
+}
+```
+
+**Why DNS validation over email?** DNS validation is automated — Terraform creates the CNAME records in Route 53 and ACM polls them. Email validation would require manual action on every renewal. ACM auto-renews DNS-validated certs 60 days before expiry at no cost.
+
+**Certificate ARN:** `arn:aws:acm:eu-central-1:569144120198:certificate/9a9373f8-af0b-4208-b78a-64385caa50e4`
+
+The `for_each` on `domain_validation_options` deduplicates the CNAME records — a wildcard cert and its apex SAN share one validation record, so only one CNAME is created despite two domains being covered.
+
+---
+
+### 9.4 Namecheap to Route 53 Delegation
+
+After Route 53 creates the hosted zone, DNS authority is still with Namecheap. To transfer control:
+
+1. Go to **Namecheap → Domain List → `venkatesh-gangavarapu.online` → Manage**
+2. Under **Nameservers**, select **Custom DNS**
+3. Enter the four Route 53 NS records
+4. Save
+
+Propagation takes 5–30 minutes globally. Different DNS resolvers pick it up at different times (Cloudflare and Route 53's own nameservers resolved it within ~6 minutes; Google's cache took longer). ACM validates against the authoritative nameservers, so validation can succeed even before full global propagation.
+
+**How to verify propagation:**
+```bash
+# Should show awsdns nameservers when propagated
+nslookup -type=NS venkatesh-gangavarapu.online 1.1.1.1
+```
+
+---
+
+### 9.5 AWS Load Balancer Controller and IRSA
+
+The AWS Load Balancer Controller is a Kubernetes controller that watches `Ingress` resources and creates/manages ALBs in AWS. Without it, Kubernetes does not know how to provision AWS load balancers.
+
+**Why IRSA for the controller?** The controller needs IAM permissions to create and configure ALBs, target groups, security group rules, and ACM listeners. IRSA scopes these permissions to the controller's Kubernetes service account (`aws-load-balancer-controller` in `kube-system`) — no static credentials, no node-wide over-privilege.
+
+The IRSA role `petclinic-dev-lb-controller-role` uses the v2.8.1 IAM policy from the official AWS LBC GitHub (`lb-controller-iam-policy.json`, stored in `terraform/modules/eks/`). The policy is attached via Terraform; the Helm values bind the service account to the role ARN via an annotation.
+
+**Installation** (via `scripts/install-alb-controller.sh`):
+
+```bash
+bash scripts/install-alb-controller.sh --env dev
+```
+
+The script:
+1. Resolves the VPC ID from the cluster description
+2. Adds the `eks` Helm chart repository
+3. Installs `aws-load-balancer-controller` from `eks/aws-load-balancer-controller`
+4. Uses the ECR-hosted image (`602401143452.dkr.ecr.eu-central-1.amazonaws.com/amazon/aws-load-balancer-controller`) to avoid Docker Hub rate limits
+
+**Verification:**
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+# NAME                                           READY   STATUS    RESTARTS   AGE
+# aws-load-balancer-controller-7454588cd8-wxtms  1/1     Running   0          25s
+```
+
+---
+
+### 9.6 Ingress Manifest
+
+The Ingress resource at `k8s/base/ingress/ingress.yaml` tells the ALB controller exactly what ALB to create and how to route traffic.
+
+**Key annotations explained:**
+
+| Annotation | Value | Why |
+|-----------|-------|-----|
+| `scheme: internet-facing` | — | ALB gets a public IP; `internal` would be VPC-only |
+| `target-type: ip` | — | Routes directly to pod IPs (VPC CNI) — faster than `instance` mode which goes through NodePort |
+| `certificate-arn` | ACM cert ARN | TLS termination at the ALB; traffic to pods is plain HTTP |
+| `listen-ports` | `[{HTTP:80},{HTTPS:443}]` | ALB listens on both; HTTP redirects to HTTPS |
+| `ssl-redirect: "443"` | — | Automatic HTTP→HTTPS redirect without application changes |
+| `security-groups` | ALB SG ID | Locks the ALB to our pre-created SG (enforces the VPC perimeter) |
+| `healthcheck-path: /actuator/health` | — | Spring Boot Actuator health endpoint — returns 200 when service is UP |
+
+**Routing:** All paths (`/`) route to the `api-gateway` service on port 8080. The API Gateway serves the AngularJS frontend and proxies backend API calls — there is no need to expose individual microservices via ALB.
+
+---
+
+### 9.7 Dev Environment Apply: What Was Created
+
+Applied on 2026-06-28 across two Terraform steps + two post-Terraform steps.
+
+**Step 1 — Terraform (before NS switch):**
+
+| Resource | Detail |
+|----------|--------|
+| `aws_route53_zone` | `venkatesh-gangavarapu.online` — Zone ID: `Z05630701AKIZST1G5L17` |
+| `aws_acm_certificate` | `*.venkatesh-gangavarapu.online` + apex SAN |
+| `aws_route53_record` ×2 | CNAME validation records (wildcard + apex share one record) |
+| `aws_iam_policy` | `petclinic-dev-lb-controller-policy` (latest policy from LBC `main` branch) |
+| `aws_iam_role` | `petclinic-dev-lb-controller-role` |
+| `aws_iam_role_policy_attachment` | Policy → role |
+
+**Between steps:** Updated Namecheap nameservers. Propagated to Cloudflare in ~6 minutes; Google DNS took longer (cached old records).
+
+**Step 2 — Terraform (after NS switch):**
+
+| Resource | Detail |
+|----------|--------|
+| `aws_acm_certificate_validation` | Completed in 1s — Route 53 already had CNAME records; ACM validated immediately |
+
+**Post-Terraform — ALB Controller + Ingress:**
+
+| Action | Detail |
+|--------|--------|
+| `bash scripts/install-alb-controller.sh --env dev` | Installed `aws-load-balancer-controller` v2.x via Helm into `kube-system` |
+| `kubectl create namespace petclinic-dev` | Created app namespace |
+| `kubectl apply -f k8s/base/ingress/ingress.yaml` | ALB controller provisioned ALB automatically (~3 min) |
+
+**Post-Terraform — Route 53 A record (PETPLAT-31):**
+
+After the ALB was provisioned, its DNS name and hosted zone ID were retrieved:
+
+```bash
+aws elbv2 describe-load-balancers --region eu-central-1 \
+  --query "LoadBalancers[?contains(DNSName,'petclini')].{DNSName:DNSName,ZoneId:CanonicalHostedZoneId}"
+```
+
+An alias A record was added to `dev/main.tf` and applied via Terraform:
+
+```hcl
+resource "aws_route53_record" "dev_app" {
+  zone_id = module.dns.zone_id
+  name    = "petclinic-dev.venkatesh-gangavarapu.online"
+  type    = "A"
+  alias {
+    name                   = "k8s-petclini-petclini-00eca135a7-422108278.eu-central-1.elb.amazonaws.com"
+    zone_id                = "Z215JYRZR1TBD5"
+    evaluate_target_health = true
+  }
+}
+```
+
+**End-to-end verification:**
+
+```bash
+# DNS resolves
+nslookup petclinic-dev.venkatesh-gangavarapu.online 1.1.1.1
+# → 3.123.104.118  (ALB IP)
+
+# HTTP redirects to HTTPS
+curl -sI http://petclinic-dev.venkatesh-gangavarapu.online
+# → HTTP/1.1 301 Moved Permanently  (Server: awselb/2.0)
+
+# HTTPS reachable (backend empty until E-8/E-16 deploy api-gateway pods)
+curl -sk https://petclinic-dev.venkatesh-gangavarapu.online/actuator/health
+# → "Backend service does not exist"  (expected — no pods yet)
+```
+
+**Final outputs:**
+
+| Output | Value |
+|--------|-------|
+| `certificate_arn` | `arn:aws:acm:eu-central-1:569144120198:certificate/9a9373f8-af0b-4208-b78a-64385caa50e4` |
+| `lb_controller_role_arn` | `arn:aws:iam::569144120198:role/petclinic-dev-lb-controller-role` |
+| `app_url` | `https://petclinic-dev.venkatesh-gangavarapu.online` |
+| ALB DNS | `k8s-petclini-petclini-00eca135a7-422108278.eu-central-1.elb.amazonaws.com` |
+
+---
+
+### 9.8 Known Gotcha: Two-Step Apply for ACM Validation
+
+**Symptom:** `terraform apply` hangs indefinitely (or times out after 40 minutes) when `aws_acm_certificate_validation` is included in the plan before the registrar NS switch has propagated.
+
+**Cause:** `aws_acm_certificate_validation` is a blocking resource — Terraform polls the ACM API until the certificate status transitions to `ISSUED`. If the nameservers haven't been updated yet, ACM cannot query the Route 53 CNAME records to validate ownership, so it never issues the certificate.
+
+**Fix:** Split the apply into two targeted steps:
+
+```bash
+# Step 1 — everything except the blocking validation resource
+terraform apply \
+  -target=module.dns.aws_route53_zone.main \
+  -target=module.dns.aws_acm_certificate.main \
+  -target='module.dns.aws_route53_record.cert_validation["*.venkatesh-gangavarapu.online"]' \
+  -target='module.dns.aws_route53_record.cert_validation["venkatesh-gangavarapu.online"]' \
+  -target=module.eks.aws_iam_policy.lb_controller \
+  -target=module.eks.aws_iam_role.lb_controller \
+  -target=module.eks.aws_iam_role_policy_attachment.lb_controller \
+  -auto-approve
+
+# → Update registrar nameservers here, wait for propagation
+
+# Step 2 — the remaining resource (now completes in seconds)
+terraform plan -out plan.out && terraform apply plan.out
+```
+
+**Propagation check:**
+```bash
+# Validate against Cloudflare (faster than Google's cache)
+nslookup -type=NS venkatesh-gangavarapu.online 1.1.1.1
+```
+
+---
+
+### 9.9 Known Gotcha: ALB Controller IAM Policy Missing DescribeListenerAttributes
+
+**Symptom:** Ingress resource is created but ALB never provisions. `kubectl describe ingress` shows repeated events:
+
+```
+Warning  FailedDeployModel  ingress  Failed deploy model due to operation error
+Elastic Load Balancing v2: DescribeListenerAttributes, StatusCode: 403,
+api error AccessDenied: ... is not authorized to perform:
+elasticloadbalancing:DescribeListenerAttributes
+```
+
+**Cause:** The pinned v2.8.1 IAM policy JSON (`lb-controller-iam-policy.json`) does not include `elasticloadbalancing:DescribeListenerAttributes`, which was added to the policy in a later controller release. The Helm chart and the IAM policy version got out of sync.
+
+**Fix applied:**
+
+1. Downloaded the latest policy from the `main` branch of the LBC GitHub repo:
+   ```bash
+   curl -sL https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json \
+     -o terraform/modules/eks/lb-controller-iam-policy.json
+   ```
+
+2. Ran `terraform apply` — Terraform detected the policy document changed and updated the IAM policy in-place (0 destroy, 1 change). The controller picked up the new permissions within seconds via IRSA token refresh.
+
+**Rule going forward:** Always use the `main` branch URL (not a pinned version tag) for the LBC IAM policy, or pin to the same version as the Helm chart being installed. Mismatches between the controller binary version and the policy will produce 403 errors on newly added API actions.
+
+---
+
+## 10. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -1641,7 +2128,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 9. Security Practices Explained
+## 11. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -1672,7 +2159,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 10. Cost Considerations
+## 12. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -1690,7 +2177,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 11. Common Mistakes and How to Avoid Them
+## 13. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -1738,7 +2225,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 12. Glossary
+## 14. Glossary
 
 | Term | Definition |
 |------|-----------|
