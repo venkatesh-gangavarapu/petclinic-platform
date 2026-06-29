@@ -1,0 +1,15 @@
+# Dev environment overrides for petclinic-service Helm chart
+# Merged with per-service values files (e.g., helm-values/customers-service.yaml)
+# Applied via: helm upgrade --install {service} helm/petclinic-service/ -f helm-values/{service}.yaml -f helm-values/dev.yaml
+
+replicaCount: 1  # Single replica for cost optimization
+
+autoscaling:
+  enabled: false  # No HPA in dev
+
+podDisruptionBudget:
+  enabled: false  # No PDB in dev
+
+# Image tag will be set by CI/CD pipeline (e.g., --set image.tag=a1b2c3d)
+image:
+  pullPolicy: IfNotPresent

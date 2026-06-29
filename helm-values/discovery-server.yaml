@@ -1,0 +1,34 @@
+# discovery-server (Eureka) service values
+# Merged with dev.yaml at deploy time
+
+service:
+  port: 8761
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "docker"
+  - name: JAVA_TOOL_OPTIONS
+    value: "-Xmx128m -XX:MaxMetaspaceSize=100m -XX:+UseContainerSupport"
+
+initContainers:
+  - name: wait-for-config-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do echo "waiting for config-server..."; sleep 5; done']
+
+probes:
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15

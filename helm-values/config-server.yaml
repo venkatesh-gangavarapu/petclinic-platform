@@ -1,0 +1,31 @@
+# config-server service values
+# Merged with dev.yaml at deploy time
+
+service:
+  port: 8888
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "docker"
+  - name: JAVA_TOOL_OPTIONS
+    value: "-Xmx128m -XX:MaxMetaspaceSize=100m -XX:+UseContainerSupport"
+
+initContainers: []  # config-server has no dependencies
+
+probes:
+  readiness:
+    path: /actuator/health
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  liveness:
+    path: /actuator/health
+    initialDelaySeconds: 60
+    periodSeconds: 15

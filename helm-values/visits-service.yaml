@@ -1,0 +1,54 @@
+# visits-service values
+# Merged with dev.yaml at deploy time
+# Uses MySQL datasource and rds-credentials secret
+# Has 3 init containers: config, discovery, AND customers-service (FK dependency)
+
+service:
+  port: 8082
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "docker,mysql"
+  - name: JAVA_TOOL_OPTIONS
+    value: "-Xmx128m -XX:MaxMetaspaceSize=100m -XX:+UseContainerSupport"
+  - name: SPRING_DATASOURCE_URL
+    value: "jdbc:mysql://petclinic-mysql:3306/petclinic?serverTimezone=UTC&useSSL=false"
+  - name: SPRING_DATASOURCE_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: rds-credentials
+        key: username
+  - name: SPRING_DATASOURCE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: rds-credentials
+        key: password
+
+initContainers:
+  - name: wait-for-config-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do echo "waiting for config-server..."; sleep 5; done']
+  - name: wait-for-discovery-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://discovery-server:8761/actuator/health; do echo "waiting for discovery-server..."; sleep 5; done']
+  - name: wait-for-customers-service
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://customers-service:8081/actuator/health; do echo "waiting for customers-service (FK dependency)..."; sleep 5; done']
+
+probes:
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15

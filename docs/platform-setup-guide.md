@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-28 (E-8 Kubernetes Base Manifests added)
+**Last Updated:** 2026-06-29 (E-9 Kubernetes Values & Overlays added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -93,11 +93,19 @@ This guide explains every infrastructure decision made in the petclinic-platform
     - [Services Running and What Was Applied](#116-services-running-and-what-was-applied)
     - [Known Gotcha: t4g.small Memory Limits with 8 Spring Boot Services](#117-known-gotcha-t4gsmall-memory-limits-with-8-spring-boot-services)
     - [Known Gotcha: ALB 504 — Wrong Node Security Group (Again)](#118-known-gotcha-alb-504--wrong-node-security-group-again)
-12. [The Full Setup Workflow](#12-the-full-setup-workflow)
-13. [Security Practices Explained](#13-security-practices-explained)
-14. [Cost Considerations](#14-cost-considerations)
-15. [Common Mistakes and How to Avoid Them](#15-common-mistakes-and-how-to-avoid-them)
-16. [Glossary](#16-glossary)
+12. [E-9: Kubernetes Values & Overlays](#12-e-9-kubernetes-values--overlays)
+    - [The Helm Values Architecture](#121-the-helm-values-architecture)
+    - [Dev Environment Values](#122-dev-environment-values-helm-valuesdevelopmentyaml)
+    - [Per-Service Values Files](#123-per-service-values-files)
+    - [Overlay Resources](#124-overlay-resources-k8soverlaysdev)
+    - [File Structure Summary](#125-file-structure-summary)
+    - [Deploying a Service](#126-deploying-a-service)
+    - [Why Helm, Not Kustomize?](#127-why-helm-not-kustomize)
+13. [The Full Setup Workflow](#13-the-full-setup-workflow)
+14. [Security Practices Explained](#14-security-practices-explained)
+15. [Cost Considerations](#15-cost-considerations)
+16. [Common Mistakes and How to Avoid Them](#16-common-mistakes-and-how-to-avoid-them)
+17. [Glossary](#17-glossary)
 
 ---
 
@@ -2573,7 +2581,200 @@ curl -sk https://petclinic-dev.venkatesh-gangavarapu.online/actuator/health
 
 ---
 
-## 12. The Full Setup Workflow
+## 12. E-9: Kubernetes Values & Overlays
+
+**Jira Epic:** E-9 | **Tickets:** PETPLAT-45 (dev overlay) | **Blocks:** E-16
+
+Environment-specific configuration values and namespace-level resources. E-9 defines what the Helm chart (E-16) will deploy per environment. All 8 services share a **single generic chart**; per-service and per-environment configuration lives in `helm-values/`.
+
+---
+
+### 12.1 The Helm Values Architecture
+
+Rather than 8 separate charts or Kustomize overlays with hundreds of patches, the platform uses:
+- **One generic chart** (`helm/petclinic-service/`) shared by all 8 services
+- **Per-service values** (`helm-values/{service}.yaml`) — port, init containers, env vars specific to that service
+- **Per-environment values** (`helm-values/{env}.yaml`) — replicas, autoscaling, resource limits per environment
+
+At deploy time, Helm merges all three:
+```bash
+helm upgrade --install customers-service helm/petclinic-service/ \
+  -f helm-values/customers-service.yaml \
+  -f helm-values/dev.yaml \
+  --set image.tag=${COMMIT_SHA}
+```
+
+This approach scales: adding a new service = one new values file, not a new chart.
+
+---
+
+### 12.2 Dev Environment Values (`helm-values/dev.yaml`)
+
+Single file, applies to all 8 services:
+
+```yaml
+replicaCount: 1
+autoscaling:
+  enabled: false
+podDisruptionBudget:
+  enabled: false
+image:
+  pullPolicy: IfNotPresent
+```
+
+Per-environment config (replicas, HPA, PDB) is separated from per-service config. Prod will override with `replicas: 2`, `autoscaling.enabled: true`, etc.
+
+---
+
+### 12.3 Per-Service Values Files
+
+Eight files in `helm-values/`, one per service:
+
+| Service | Port | Special Config |
+|---------|------|-----------------|
+| `config-server.yaml` | 8888 | No init containers (no deps) |
+| `discovery-server.yaml` | 8761 | Waits for config-server |
+| `api-gateway.yaml` | 8080 | 200m/1000m CPU (higher for routing) |
+| `customers-service.yaml` | 8081 | MySQL profile, rds-credentials |
+| `visits-service.yaml` | 8082 | MySQL profile, 3 init containers (FK dep on customers) |
+| `vets-service.yaml` | 8083 | `docker,mysql,production` profile (Caffeine cache) |
+| `genai-service.yaml` | 8084 | `replicaCount: 0`, OPENAI_API_KEY |
+| `admin-server.yaml` | 9090 | Spring Boot Admin dashboard |
+
+Each file specifies:
+- Service port
+- Resource requests/limits
+- Spring profiles
+- Env vars (including secrets from K8s Secrets)
+- Init containers and their dependency chains
+- Probe paths (readiness, liveness)
+
+Example from `customers-service.yaml`:
+
+```yaml
+service:
+  port: 8081
+
+env:
+  - name: SPRING_PROFILES_ACTIVE
+    value: "docker,mysql"
+  - name: SPRING_DATASOURCE_URL
+    value: "jdbc:mysql://petclinic-mysql:3306/petclinic?serverTimezone=UTC"
+  - name: SPRING_DATASOURCE_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: rds-credentials
+        key: username
+  - name: SPRING_DATASOURCE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: rds-credentials
+        key: password
+
+initContainers:
+  - name: wait-for-config-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do sleep 5; done']
+  - name: wait-for-discovery-server
+    image: busybox:1.36
+    command: ['sh', '-c', 'until wget -qO- http://discovery-server:8761/actuator/health; do sleep 5; done']
+
+probes:
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15
+```
+
+All services use `-Xmx128m -XX:MaxMetaspaceSize=100m` in `JAVA_TOOL_OPTIONS` to fit on t4g.small nodes.
+
+---
+
+### 12.4 Overlay Resources (`k8s/overlays/dev/`)
+
+Namespace-level resources that are not per-service:
+
+| File | Purpose |
+|------|---------|
+| `kustomization.yaml` | Ties together overlay resources (transitional, E-16 replaces with Helm) |
+| `resource-quota.yaml` | Hard limits on CPU/memory/pods for the dev namespace |
+
+Dev resource quota:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: petclinic-dev-quota
+  namespace: petclinic-dev
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: "4Gi"
+    limits.cpu: "4"
+    limits.memory: "4Gi"
+    pods: "30"
+```
+
+This prevents runaway deployments from consuming all cluster resources. If a new pod's requests would exceed the quota, the scheduler rejects it with `exceeds quota`.
+
+---
+
+### 12.5 File Structure Summary
+
+```
+helm-values/
+├── dev.yaml                    # 1 replica, no HPA, no PDB
+├── config-server.yaml          # port 8888, no init containers
+├── discovery-server.yaml       # port 8761, waits for config-server
+├── api-gateway.yaml            # port 8080, 200m/1000m CPU
+├── customers-service.yaml      # port 8081, MySQL, 2 init containers
+├── visits-service.yaml         # port 8082, MySQL, 3 init containers (FK dep)
+├── vets-service.yaml           # port 8083, mysql,production profiles
+├── genai-service.yaml          # port 8084, replicas=0, OPENAI_API_KEY
+└── admin-server.yaml           # port 9090, 2 init containers
+
+k8s/overlays/dev/
+├── kustomization.yaml          # Overlay root (transitional)
+└── resource-quota.yaml         # Namespace quota
+```
+
+---
+
+### 12.6 Deploying a Service
+
+Manual deployment (for testing):
+```bash
+helm upgrade --install customers-service helm/petclinic-service/ \
+  -n petclinic-dev \
+  -f helm-values/customers-service.yaml \
+  -f helm-values/dev.yaml \
+  --set image.repository=569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/customers-service \
+  --set image.tag=a1b2c3d
+```
+
+In production, ArgoCD automates this (E-15).
+
+---
+
+### 12.7 Why Helm, Not Kustomize?
+
+| Feature | Kustomize | Helm |
+|---------|-----------|------|
+| Templating | `$()` patches + overlays | Full Jinja2-like templating |
+| Reuse | Overlays patch one service at a time | Single chart, parameterized via values |
+| Dependency graphs | Weak (kustomization.yaml order) | Strong (`helm dependency update`) |
+| Ecosystem | Kubernetes native | Industry standard for K8s deployments |
+
+Kustomize works for simple scenarios. For 8 services with different ports, probes, init containers, and two environments, Helm's parameterization scales better.
+
+---
+
+## 13. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -2606,7 +2807,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 13. Security Practices Explained
+## 14. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -2637,7 +2838,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 14. Cost Considerations
+## 15. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -2655,7 +2856,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 15. Common Mistakes and How to Avoid Them
+## 16. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -2703,7 +2904,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 16. Glossary
+## 17. Glossary
 
 | Term | Definition |
 |------|-----------|
