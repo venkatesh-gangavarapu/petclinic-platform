@@ -1,0 +1,110 @@
+# Petclinic Service — Default Helm Values
+# Per-service overrides in helm-values/{service}.yaml
+# Per-environment overrides in helm-values/{dev|prod}.yaml
+
+replicaCount: 1
+
+image:
+  # Set per-service: {account}.dkr.ecr.eu-central-1.amazonaws.com/petclinic-{env}/{service}
+  repository: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  # Set per-service (e.g., 8080 for api-gateway, 8081 for customers-service)
+  port: 8080
+  targetPort: 8080
+  type: ClusterIP
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Kubernetes probes — paths can be overridden per-service
+probes:
+  startup:
+    path: /actuator/health
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 30
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# Environment variables — set per-service
+env: []
+# Example:
+# - name: SPRING_PROFILES_ACTIVE
+#   value: "docker,mysql"
+# - name: SPRING_DATASOURCE_USERNAME
+#   valueFrom:
+#     secretKeyRef:
+#       name: rds-credentials
+#       key: username
+
+# Init containers for startup ordering — set per-service
+initContainers: []
+# Example:
+# - name: wait-for-config-server
+#   image: busybox:1.36
+#   command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do sleep 5; done']
+
+# Security context — applied consistently to all services
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  container:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: false
+
+# Autoscaling (HPA) — disabled for dev, enabled for prod
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# Pod Disruption Budget — disabled for dev, enabled for prod
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Node affinity and pod affinity — can be set per-service if needed
+affinity: {}
+
+# Tolerations — can be set if using tainted nodes
+tolerations: []
+
+# Node selector — can be set to select specific node pools
+nodeSelector: {}
+
+# Labels to attach to the pod
+labels: {}
+
+# Service Account configuration
+serviceAccount:
+  create: true
+  annotations: {}
+  # Annotations include IRSA role ARN for External Secrets, ALB Controller, etc.
+  # Example: iam.gke.io/gcp-service-account: sa-name@project.iam.gserviceaccount.com
+  # For AWS IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/ROLE_NAME
+  name: ""  # If not set, uses release name

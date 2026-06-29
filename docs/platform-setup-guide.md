@@ -1,6 +1,6 @@
 # Petclinic Platform — Infrastructure Setup Guide
 
-**Last Updated:** 2026-06-29 (E-9 Kubernetes Values & Overlays added)
+**Last Updated:** 2026-06-29 (E-16 Helm Charts added)
 **Audience:** DevOps beginners and students learning cloud infrastructure
 
 ## Purpose
@@ -101,11 +101,16 @@ This guide explains every infrastructure decision made in the petclinic-platform
     - [File Structure Summary](#125-file-structure-summary)
     - [Deploying a Service](#126-deploying-a-service)
     - [Why Helm, Not Kustomize?](#127-why-helm-not-kustomize)
-13. [The Full Setup Workflow](#13-the-full-setup-workflow)
-14. [Security Practices Explained](#14-security-practices-explained)
-15. [Cost Considerations](#15-cost-considerations)
-16. [Common Mistakes and How to Avoid Them](#16-common-mistakes-and-how-to-avoid-them)
-17. [Glossary](#17-glossary)
+13. [E-16: Helm Charts](#13-e-16-helm-charts)
+    - [Chart Architecture](#131-chart-architecture)
+    - [Template Files](#132-template-files)
+    - [Testing & Validation](#133-testing--validation)
+    - [Deploying Services with Helm](#134-deploying-services-with-helm)
+14. [The Full Setup Workflow](#14-the-full-setup-workflow)
+15. [Security Practices Explained](#15-security-practices-explained)
+16. [Cost Considerations](#16-cost-considerations)
+17. [Common Mistakes and How to Avoid Them](#17-common-mistakes-and-how-to-avoid-them)
+18. [Glossary](#18-glossary)
 
 ---
 
@@ -2774,7 +2779,133 @@ Kustomize works for simple scenarios. For 8 services with different ports, probe
 
 ---
 
-## 13. The Full Setup Workflow
+## 13. E-16: Helm Charts
+
+**Jira Epic:** E-16 | **Tickets:** PETPLAT-107 through PETPLAT-111 | **Blocks:** E-17
+
+A single, reusable Helm chart (`helm/petclinic-service/`) that deploys all 8 Petclinic services. Per-service and per-environment configuration is in `helm-values/` files (created in E-9). This replaces raw Kubernetes YAML + Kustomize overlays.
+
+---
+
+### 13.1 Chart Architecture
+
+```
+helm/petclinic-service/
+├── Chart.yaml                    # Chart metadata
+├── values.yaml                   # Default values for all services
+└── templates/
+    ├── deployment.yaml           # Deployment (probes, resources, env vars, init containers)
+    ├── service.yaml              # ClusterIP Service
+    ├── configmap.yaml            # Non-secret configuration
+    ├── serviceaccount.yaml       # ServiceAccount (with IRSA support)
+    ├── hpa.yaml                  # HorizontalPodAutoscaler (conditional)
+    ├── pdb.yaml                  # PodDisruptionBudget (conditional)
+    └── _helpers.tpl              # Template helpers (labels, names)
+```
+
+**Key design**: A **single chart** shared by all 8 services. Per-service differences are driven entirely by values files, not separate charts.
+
+---
+
+### 13.2 Template Files
+
+| Template | Purpose |
+|----------|---------|
+| `deployment.yaml` | Pod spec: image, ports, env vars, init containers, probes, resources, security context, strategy (Recreate) |
+| `service.yaml` | ClusterIP Service exposing the container port within the cluster |
+| `configmap.yaml` | Non-secret config (CONFIG_SERVER_URL, SPRING_APPLICATION_NAME) |
+| `serviceaccount.yaml` | Kubernetes ServiceAccount with IRSA annotation support |
+| `hpa.yaml` | HorizontalPodAutoscaler — rendered only when `autoscaling.enabled: true` |
+| `pdb.yaml` | PodDisruptionBudget — rendered only when `podDisruptionBudget.enabled: true` |
+| `_helpers.tpl` | Template functions for labels, selectors, names (Kubernetes recommended practices) |
+
+**Templating approach:**
+- Deployment uses `.Values.probes.*` for all three probes (startup, readiness, liveness)
+- HPA and PDB use `{{- if .Values.autoscaling.enabled }}` conditional rendering
+- Labels follow Kubernetes recommended naming: `app.kubernetes.io/name`, `app.kubernetes.io/part-of`, etc.
+- Security context applied at both pod and container level
+
+---
+
+### 13.3 Testing & Validation
+
+**helm lint** validates chart syntax:
+```bash
+helm lint helm/petclinic-service/
+# 1 chart(s) linted, 0 chart(s) failed
+```
+
+**helm template** renders YAML for each service + environment:
+```bash
+helm template customers-service helm/petclinic-service/ \
+  -f helm-values/customers-service.yaml \
+  -f helm-values/dev.yaml \
+  --namespace petclinic-dev \
+  --set image.repository=... \
+  --set image.tag=v1.0.0
+```
+
+**Validation script** (`scripts/validate-helm.sh`) tests all 8 services:
+```bash
+bash scripts/validate-helm.sh
+
+=== Helm Chart Validation ===
+
+[1/3] Running helm lint...
+✓ helm lint passed
+
+[2/3] Testing helm template rendering...
+  config-server (dev): OK
+  discovery-server (dev): OK
+  api-gateway (dev): OK
+  customers-service (dev): OK
+  visits-service (dev): OK
+  vets-service (dev): OK
+  genai-service (dev): OK
+  admin-server (dev): OK
+
+[3/3] Validating rendered YAML syntax...
+✓ All rendered templates have valid YAML structure
+
+=== All validations passed ===
+```
+
+All 8 services render successfully with correct:
+- Container ports (8888, 8761, 8080, 8081, 8082, 8083, 8084, 9090)
+- Resource requests/limits (100m/500m CPU for most, 200m/1000m for api-gateway)
+- Init containers (dependency chains)
+- Environment variables (SPRING_PROFILES_ACTIVE, database URLs, secrets)
+- Probe paths (readiness/liveness specific to each service)
+
+---
+
+### 13.4 Deploying Services with Helm
+
+Manual deployment (for testing or ArgoCD-independent deploys):
+
+```bash
+# Deploy customers-service to dev
+helm upgrade --install customers-service helm/petclinic-service/ \
+  -n petclinic-dev \
+  -f helm-values/customers-service.yaml \
+  -f helm-values/dev.yaml \
+  --set image.repository=569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/customers-service \
+  --set image.tag=a1b2c3d
+
+# Deploy api-gateway to dev
+helm upgrade --install api-gateway helm/petclinic-service/ \
+  -n petclinic-dev \
+  -f helm-values/api-gateway.yaml \
+  -f helm-values/dev.yaml \
+  --set image.repository=569144120198.dkr.ecr.eu-central-1.amazonaws.com/petclinic-dev/api-gateway \
+  --set image.tag=a1b2c3d
+```
+
+**In production**, ArgoCD automates this (E-17).
+
+---
+
+## 14. The Full Setup Workflow
 
 Here is the complete sequence to go from zero to a working Terraform setup:
 
@@ -2807,7 +2938,7 @@ terraform apply plan.out                        # apply exactly the saved plan
 
 ---
 
-## 14. Security Practices Explained
+## 15. Security Practices Explained
 
 ### Why `*.tfvars` Is Gitignored
 
@@ -2838,7 +2969,7 @@ The IAM user or role used for Terraform should have only the permissions needed 
 
 ---
 
-## 15. Cost Considerations
+## 16. Cost Considerations
 
 This project is designed for learning while minimizing AWS costs. Key decisions:
 
@@ -2856,7 +2987,7 @@ The S3 bucket storage cost for state files is also negligible — state files ar
 
 ---
 
-## 16. Common Mistakes and How to Avoid Them
+## 17. Common Mistakes and How to Avoid Them
 
 ### Mistake 1: Running `terraform apply` Without a Plan
 
@@ -2904,7 +3035,7 @@ The account ID (`569144120198`) should only appear in `backend.tf`, which is spe
 
 ---
 
-## 17. Glossary
+## 18. Glossary
 
 | Term | Definition |
 |------|-----------|

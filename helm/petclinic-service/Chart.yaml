@@ -1,0 +1,14 @@
+apiVersion: v2
+name: petclinic-service
+description: A generic Helm chart for Petclinic microservices. All 8 services share this chart; per-service config is in helm-values/{service}.yaml
+type: application
+version: 0.1.0
+appVersion: "3.0.0"
+keywords:
+  - petclinic
+  - microservices
+  - kubernetes
+  - spring-boot
+maintainers:
+  - name: Petclinic Platform Team
+    email: gangavarapuvenkatesh3@gmail.com
